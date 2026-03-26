@@ -4,7 +4,10 @@ import pickle
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
 from sklearn.metrics import mean_squared_log_error
 from sklearn.preprocessing import LabelEncoder
-from warpgbm.cuda import node_kernel
+try:
+    from warpgbm.cuda import node_kernel
+except ImportError:
+    node_kernel = None
 from warpgbm.metrics import rmsle_torch, softmax, log_loss_torch, accuracy_torch
 from tqdm import tqdm
 from typing import Tuple
@@ -28,6 +31,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         colsample_bytree=1.0,
         random_state=None,
         warm_start=False,
+        loss="mse",
+        huber_delta=1.0,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -42,6 +47,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
             colsample_bytree=colsample_bytree,
+            loss=loss,
+            huber_delta=huber_delta,
         )
 
         self.objective = objective
@@ -66,7 +73,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_samples = None
         self.min_child_weight = min_child_weight
         self.min_split_gain = min_split_gain
-        self.best_bin = torch.tensor([-1], dtype=torch.int32, device=self.device)
+        _device = self.device if torch.cuda.is_available() else "cpu"
+        self.best_bin = torch.tensor([-1], dtype=torch.int32, device=_device)
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
@@ -79,6 +87,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_feature_importance_ = None
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
+        self.loss = loss
+        self.huber_delta = huber_delta
 
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
@@ -140,6 +150,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if kwargs["colsample_bytree"] <= 0 or kwargs["colsample_bytree"] > 1:
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
+            )
+        if kwargs["loss"] not in ["mse", "huber"]:
+            raise ValueError(
+                f"loss must be 'mse' or 'huber', got {kwargs['loss']}."
+            )
+        if not isinstance(kwargs["huber_delta"], (int, float)) or kwargs["huber_delta"] <= 0:
+            raise ValueError(
+                f"huber_delta must be a positive number, got {kwargs['huber_delta']}."
             )
 
     def _compute_tree_predictions(self, tree, bin_indices):
