@@ -353,6 +353,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 print(f"Model already has {self._trees_trained} trees (n_estimators={self.n_estimators}). No additional training needed.")
                 return self
 
+        if self.loss == "huber" and self.objective != "regression":
+            raise ValueError(
+                f"loss='huber' is only supported for objective='regression', "
+                f"got objective='{self.objective}'."
+            )
+
         if era_id is None:
             era_id = np.ones(X.shape[0], dtype="int32")
 
