@@ -740,7 +740,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
         for i in range(start_iter, self.n_estimators):
-            self.residual = self.Y_gpu - self.gradients
+            residual = self.Y_gpu - self.gradients
+            if self.loss == "huber":
+                self.residual = torch.clamp(residual, -self.huber_delta, self.huber_delta)
+            else:
+                self.residual = residual
 
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
