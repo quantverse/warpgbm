@@ -300,7 +300,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 # No early stopping = set to "never trigger"
                 early_stopping_rounds = self.n_estimators + 1
 
-            valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy"]
+            valid_metrics = ["mse", "corr", "rmsle", "logloss", "accuracy", "huber"]
             if eval_metric not in valid_metrics:
                 raise ValueError(
                     f"Invalid eval_metric: {eval_metric}. Choose from {valid_metrics}."
@@ -688,6 +688,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return 1 - torch.corrcoef(torch.vstack([y_true, y_pred]))[0, 1].item()
         elif self.eval_metric == "rmsle":
             return rmsle_torch(y_true, y_pred).item()
+        elif self.eval_metric == "huber":
+            delta = self.huber_delta
+            r = y_true - y_pred
+            loss = torch.where(
+                r.abs() <= delta,
+                0.5 * r ** 2,
+                delta * (r.abs() - 0.5 * delta),
+            )
+            return loss.mean().item()
         else:
             raise ValueError(f"Invalid eval_metric: {self.eval_metric}.")
 

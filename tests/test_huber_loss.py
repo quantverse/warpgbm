@@ -108,3 +108,41 @@ def test_huber_more_robust_to_outliers():
         f"Huber model (MSE={huber_error:.4f}) should outperform MSE model "
         f"(MSE={mse_error:.4f}) on clean test set when trained with outliers."
     )
+
+
+def test_huber_eval_metric_accepted():
+    """eval_metric='huber' should be accepted and produce eval loss values."""
+    X, y = _make_regression_data()
+    model = WarpGBM(
+        objective="regression",
+        loss="huber",
+        huber_delta=1.0,
+        n_estimators=10,
+        max_depth=3,
+        random_state=42,
+    )
+    model.fit(X, y, X_eval=X, y_eval=y, eval_every_n_trees=5, eval_metric="huber")
+    assert len(model.eval_loss) > 0, "eval_loss should be populated"
+    assert all(v >= 0 for v in model.eval_loss), "Huber loss values must be non-negative"
+
+
+def test_huber_eval_metric_on_mse_model():
+    """eval_metric='huber' works even when training with loss='mse'."""
+    X, y = _make_regression_data()
+    model = WarpGBM(
+        objective="regression",
+        loss="mse",
+        n_estimators=10,
+        max_depth=3,
+        random_state=42,
+    )
+    model.fit(X, y, X_eval=X, y_eval=y, eval_every_n_trees=5, eval_metric="huber")
+    assert len(model.eval_loss) > 0
+
+
+def test_invalid_eval_metric_raises():
+    """eval_metric='unknown' should raise ValueError."""
+    X, y = _make_regression_data()
+    model = WarpGBM(objective="regression", n_estimators=2)
+    with pytest.raises(ValueError, match="Invalid eval_metric"):
+        model.fit(X, y, X_eval=X, y_eval=y, eval_every_n_trees=1, eval_metric="unknown")
