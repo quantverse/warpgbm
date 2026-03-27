@@ -25,6 +25,16 @@ void launch_histogram_kernel_cuda_configurable(
     int threads_per_block = 256,
     int rows_per_thread = 1);
 
+void launch_directional_split_fused_kernel(
+    const at::Tensor &G, // [E, F, B]
+    const at::Tensor &H, // [E, F, B]
+    float min_split_gain,
+    float min_child_samples,
+    float eps,
+    at::Tensor &fused_gain,       // [F, B-1]
+    at::Tensor &fused_agreement,  // [F, B-1]
+    int threads = 128);
+
 void launch_bin_column_kernel(
     at::Tensor X,
     at::Tensor bin_edges,
@@ -42,6 +52,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("compute_histogram3", &launch_histogram_kernel_cuda_configurable, "Histogram Feature Shared Mem");
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
+    m.def("compute_split_fused", &launch_directional_split_fused_kernel, "Best Split Fused (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");
     m.def("predict_forest", &predict_with_forest, "CUDA Predictions");
 }

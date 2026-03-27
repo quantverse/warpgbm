@@ -563,6 +563,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return grad_hist, hess_hist
 
     def find_best_split(self, gradient_histogram, hessian_histogram):
+        if self.num_eras > 1:
+            return self._find_best_split_fused(gradient_histogram, hessian_histogram)
+
+        # Single-era fast path (unchanged)
         node_kernel.compute_split(
             gradient_histogram,
             hessian_histogram,
@@ -574,19 +578,41 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.threads_per_block
         )
 
-        if self.num_eras == 1:
-            era_splitting_criterion = self.per_era_gain[0,:,:]  # [F, B-1]
-            dir_score_mask = era_splitting_criterion > self.min_split_gain
-        else:
-            directional_agreement = self.per_era_direction.mean(dim=0).abs()  # [F, B-1]
-            era_splitting_criterion = self.per_era_gain.mean(dim=0)  # [F, B-1]
-            dir_score_mask = ( directional_agreement == directional_agreement.max() ) & (era_splitting_criterion > self.min_split_gain)
+        era_splitting_criterion = self.per_era_gain[0,:,:]  # [F, B-1]
+        dir_score_mask = era_splitting_criterion > self.min_split_gain
 
         if not dir_score_mask.any():
             return -1, -1
-        
+
         era_splitting_criterion[dir_score_mask == 0] = float("-inf")
-        best_idx = torch.argmax(era_splitting_criterion) #index of flattened tensor
+        best_idx = torch.argmax(era_splitting_criterion)
+        split_bins = self.num_bins - 1
+        best_feature = best_idx // split_bins
+        best_bin = best_idx % split_bins
+
+        return best_feature.item(), best_bin.item()
+
+    def _find_best_split_fused(self, gradient_histogram, hessian_histogram):
+        """Multi-era path: fused kernel reduces across eras on-GPU, outputs [F, B-1]."""
+        node_kernel.compute_split_fused(
+            gradient_histogram,
+            hessian_histogram,
+            self.min_split_gain,
+            self.min_child_weight,
+            self.L2_reg,
+            self.fused_gain,
+            self.fused_agreement,
+            self.threads_per_block
+        )
+
+        mask = (self.fused_agreement == self.fused_agreement.max()) & \
+               (self.fused_gain > self.min_split_gain)
+
+        if not mask.any():
+            return -1, -1
+
+        self.fused_gain[~mask] = float("-inf")
+        best_idx = torch.argmax(self.fused_gain)
         split_bins = self.num_bins - 1
         best_feature = best_idx // split_bins
         best_bin = best_idx % split_bins
@@ -622,9 +648,22 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         
         # Track feature importance: accumulate per-era gains for the chosen feature
         global_feature_idx = self.feat_indices_tree[local_feature].item()
-        per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [num_eras]
-        for era_idx in range(self.num_eras):
-            self.per_era_feature_importance_[era_idx, global_feature_idx] += per_era_gains[era_idx].item()
+        if self.num_eras == 1:
+            per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [1]
+            self.per_era_feature_importance_[0, global_feature_idx] += per_era_gains[0].item()
+        else:
+            # Compute per-era gains from histograms for just this (feature, bin)
+            G_hist = gradient_histogram[:, local_feature, :]   # [E, B]
+            H_hist = hessian_histogram[:, local_feature, :]    # [E, B]
+            G_L = G_hist[:, :best_bin + 1].sum(dim=1)          # [E]
+            H_L = H_hist[:, :best_bin + 1].sum(dim=1)          # [E]
+            G_total = G_hist.sum(dim=1)                         # [E]
+            H_total = H_hist.sum(dim=1)                         # [E]
+            G_R = G_total - G_L
+            H_R = H_total - H_L
+            eps = self.L2_reg
+            gains = (G_L ** 2) / (H_L + eps) + (G_R ** 2) / (H_R + eps) - (G_total ** 2) / (H_total + eps)
+            self.per_era_feature_importance_[:, global_feature_idx] += gains.cpu().numpy()
         
         split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
         left_indices = node_indices[split_mask]
@@ -705,12 +744,16 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.feat_indices_tree = self.feature_indices
             k = self.num_features
             
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        if self.num_eras > 1:
+            self.fused_gain = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
+            self.fused_agreement = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        else:
+            self.per_era_gain = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+            self.per_era_direction = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
-        
+
         # Ensure forest has enough slots
         if len(self.forest) < self.n_estimators:
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
@@ -761,8 +804,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.feat_indices_tree = self.feature_indices
             k = self.num_features
             
-        self.per_era_gain = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        self.per_era_direction = torch.zeros(self.num_eras, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        if self.num_eras > 1:
+            self.fused_gain = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
+            self.fused_agreement = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
+        else:
+            self.per_era_gain = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
+            self.per_era_direction = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
 
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0

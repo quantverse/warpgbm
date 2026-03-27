@@ -87,3 +87,101 @@ void launch_directional_split_kernel(
     }
 }
 
+// Fused kernel: reduces across eras inside the kernel, outputs [F, B-1] instead of [E, F, B-1].
+// Eliminates E× global memory writes and the subsequent Python-side reduction.
+__global__ void directional_split_fused_kernel(
+    const float *__restrict__ G,                // [E * F * B]
+    const float *__restrict__ H,                // [E * F * B]
+    int E, int F, int B,
+    float min_split_gain,
+    float min_child_samples,
+    float eps,
+    float *__restrict__ fused_gain,             // [F * (B-1)]
+    float *__restrict__ fused_agreement         // [F * (B-1)]
+)
+{
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= F) return;
+
+    int out_base = f * (B - 1);
+    float inv_E = 1.0f / (float)E;
+
+    // Accumulate across eras per bin, writing to global memory once
+    for (int e = 0; e < E; ++e) {
+        int base = e * F * B + f * B;
+
+        float G_total = 0.0f, H_total = 0.0f;
+        for (int bb = 0; bb < B; ++bb) {
+            G_total += G[base + bb];
+            H_total += H[base + bb];
+        }
+
+        float G_L = 0.0f, H_L = 0.0f;
+        for (int b = 0; b < B - 1; ++b) {
+            G_L += G[base + b];
+            H_L += H[base + b];
+
+            float G_R = G_total - G_L;
+            float H_R = H_total - H_L;
+
+            float gain = 0.0f;
+            float dir  = 0.0f;
+
+            if (H_L >= min_child_samples && H_R >= min_child_samples) {
+                gain = (G_L * G_L) / (H_L + eps)
+                     + (G_R * G_R) / (H_R + eps)
+                     - (G_total * G_total) / (H_total + eps);
+                float left_val  = G_L / (H_L + eps);
+                float right_val = G_R / (H_R + eps);
+                dir = (left_val > right_val) ? 1.0f : -1.0f;
+            }
+
+            if (e == 0) {
+                fused_gain[out_base + b]      = gain * inv_E;
+                fused_agreement[out_base + b] = dir * inv_E;
+            } else {
+                fused_gain[out_base + b]      += gain * inv_E;
+                fused_agreement[out_base + b] += dir * inv_E;
+            }
+        }
+    }
+
+    // Apply abs to agreement
+    for (int b = 0; b < B - 1; ++b) {
+        fused_agreement[out_base + b] = fabsf(fused_agreement[out_base + b]);
+    }
+}
+
+void launch_directional_split_fused_kernel(
+    const at::Tensor &G, // [E, F, B]
+    const at::Tensor &H, // [E, F, B]
+    float min_split_gain,
+    float min_child_samples,
+    float eps,
+    at::Tensor &fused_gain,       // [F, B-1]
+    at::Tensor &fused_agreement,  // [F, B-1]
+    int threads = 128)
+{
+    int E = G.size(0);
+    int F = G.size(1);
+    int B = G.size(2);
+
+    dim3 blocks((F + threads - 1) / threads);
+    dim3 thread_dims(threads);
+
+    directional_split_fused_kernel<<<blocks, thread_dims>>>(
+        G.data_ptr<float>(),
+        H.data_ptr<float>(),
+        E, F, B,
+        min_split_gain,
+        min_child_samples,
+        eps,
+        fused_gain.data_ptr<float>(),
+        fused_agreement.data_ptr<float>());
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Fused directional split kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+}
+
