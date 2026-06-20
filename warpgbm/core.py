@@ -11,6 +11,8 @@ from typing import Tuple
 from torch import Tensor
 import gc
 
+BY_ERA_HISTOGRAM_MIN_ROWS = 3072
+
 class WarpGBM(BaseEstimator, RegressorMixin):
     def __init__(
         self,
@@ -21,8 +23,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         n_estimators=100,
         min_child_weight=20,
         min_split_gain=0.0,
-        threads_per_block=256,
-        rows_per_thread=28,
+        threads_per_block=64,
+        rows_per_thread=56,
         L2_reg=1e-6,
         device="cuda",
         colsample_bytree=1.0,
@@ -67,6 +69,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.min_child_weight = min_child_weight
         self.min_split_gain = min_split_gain
         self.best_bin = torch.tensor([-1], dtype=torch.int32, device=self.device)
+        self.best_split_idx = torch.empty(1, dtype=torch.int32, device=self.device)
         self.threads_per_block = threads_per_block
         self.rows_per_thread = rows_per_thread
         self.L2_reg = L2_reg
@@ -79,6 +82,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.per_era_feature_importance_ = None
         self.era_sorted_for_hist = False
         self.era_row_boundaries = None
+        self.max_root_era_count = 0
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
 
@@ -368,6 +372,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         era_values = np.asarray(era_id)
         self.era_sorted_for_hist = False
         self.era_row_boundaries = None
+        self.max_root_era_count = 0
 
         if era_values.ndim != 1 or era_values.size == 0:
             return
@@ -383,6 +388,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             device=self.device,
             dtype=torch.int32,
         )
+        self.max_root_era_count = int(np.diff(boundaries).max())
         self.era_sorted_for_hist = True
 
     def _fit_regression(self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric):
@@ -569,7 +575,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
 
     def compute_histograms(self, sample_indices, feature_indices):
-        if getattr(self, "era_sorted_for_hist", False):
+        if (
+            getattr(self, "era_sorted_for_hist", False)
+            and sample_indices.numel() > BY_ERA_HISTOGRAM_MIN_ROWS
+        ):
             return self.compute_histograms_by_era(sample_indices, feature_indices)
 
         grad_hist = torch.zeros(
@@ -621,10 +630,37 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             hess_hist,
             self.num_bins,
             max_era_count,
+            0,
+            self.num_eras,
             self.threads_per_block,
             self.rows_per_thread,
         )
         return grad_hist, hess_hist
+
+    def compute_root_gradient_histogram_by_era(self):
+        grad_hist = torch.zeros(
+            (self.num_eras, self.num_features, self.num_bins),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self.max_root_era_count == 0:
+            return grad_hist
+
+        node_kernel.compute_histogram_feature_tile_by_era_grad(
+            self.bin_indices,
+            self.residual,
+            self.root_node_indices,
+            self.feature_indices,
+            self.era_row_boundaries,
+            grad_hist,
+            self.num_bins,
+            self.max_root_era_count,
+            0,
+            self.num_eras,
+            self.threads_per_block,
+            self.rows_per_thread,
+        )
+        return grad_hist
 
     def find_best_split(self, gradient_histogram, hessian_histogram):
         if self.num_eras > 1:
@@ -658,7 +694,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _find_best_split_fused(self, gradient_histogram, hessian_histogram):
         """Multi-era path: fused kernel reduces across eras on-GPU, outputs [F, B-1]."""
-        node_kernel.compute_split_fused(
+        compute_split = (
+            node_kernel.compute_split_fused_no_atomic
+            if self.num_bins <= 9
+            else node_kernel.compute_split_fused
+        )
+        compute_split(
             gradient_histogram,
             hessian_histogram,
             self.min_split_gain,
@@ -669,85 +710,108 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.threads_per_block
         )
 
-        mask = (self.fused_agreement == self.fused_agreement.max()) & \
-               (self.fused_gain > self.min_split_gain)
-
-        if not mask.any():
+        node_kernel.select_split_fused(
+            self.fused_gain,
+            self.fused_agreement,
+            self.min_split_gain,
+            self.best_split_idx,
+            self.threads_per_block
+        )
+        best_idx = int(self.best_split_idx.item())
+        if best_idx < 0:
             return -1, -1
 
-        self.fused_gain[~mask] = float("-inf")
-        best_idx = torch.argmax(self.fused_gain)
         split_bins = self.num_bins - 1
         best_feature = best_idx // split_bins
         best_bin = best_idx % split_bins
 
-        return best_feature.item(), best_bin.item()
+        return best_feature, best_bin
+
+
+    def _make_leaf(self, node_indices, class_k=None):
+        leaf_value = self.residual[node_indices].mean()
+        if class_k is not None:
+            # Multiclass: update specific class column
+            self.gradients[node_indices, class_k] += self.learning_rate * leaf_value
+        else:
+            # Regression: update 1D gradients
+            self.gradients[node_indices] += self.learning_rate * leaf_value
+        return {"leaf_value": leaf_value.detach(), "samples": node_indices.numel()}
 
 
     def grow_tree(self, gradient_histogram, hessian_histogram, node_indices, depth, class_k=None):
         if depth == self.max_depth:
-            leaf_value = self.residual[node_indices].mean()
-            if class_k is not None:
-                # Multiclass: update specific class column
-                self.gradients[node_indices, class_k] += self.learning_rate * leaf_value
-            else:
-                # Regression: update 1D gradients
-                self.gradients[node_indices] += self.learning_rate * leaf_value
-            return {"leaf_value": leaf_value.item(), "samples": node_indices.numel()}
+            return self._make_leaf(node_indices, class_k)
 
         parent_size = node_indices.numel()
+        if class_k is None and parent_size < 2 * self.min_child_weight:
+            return self._make_leaf(node_indices, class_k)
+
         local_feature, best_bin = self.find_best_split(
             gradient_histogram, hessian_histogram
         )
 
         if local_feature == -1:
-            leaf_value = self.residual[node_indices].mean()
-            if class_k is not None:
-                # Multiclass: update specific class column
-                self.gradients[node_indices, class_k] += self.learning_rate * leaf_value
-            else:
-                # Regression: update 1D gradients
-                self.gradients[node_indices] += self.learning_rate * leaf_value
-            return {"leaf_value": leaf_value.item(), "samples": parent_size}
+            return self._make_leaf(node_indices, class_k)
         
-        # Track feature importance: accumulate per-era gains for the chosen feature
-        global_feature_idx = self.feat_indices_tree[local_feature].long()
-        if self.num_eras == 1:
-            per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [1]
-            self.per_era_feature_importance_gpu[0, global_feature_idx] += per_era_gains[0]
+        # Track feature importance for the chosen feature/bin in one CUDA launch.
+        if self.colsample_bytree < 1.0:
+            split_feature = int(self.feat_indices_tree[local_feature].item())
         else:
-            # Compute per-era gains from histograms for just this (feature, bin)
-            G_hist = gradient_histogram[:, local_feature, :]   # [E, B]
-            H_hist = hessian_histogram[:, local_feature, :]    # [E, B]
-            G_L = G_hist[:, :best_bin + 1].sum(dim=1)          # [E]
-            H_L = H_hist[:, :best_bin + 1].sum(dim=1)          # [E]
-            G_total = G_hist.sum(dim=1)                         # [E]
-            H_total = H_hist.sum(dim=1)                         # [E]
-            G_R = G_total - G_L
-            H_R = H_total - H_L
-            eps = self.L2_reg
-            valid_era_splits = (H_L >= self.min_child_weight) & (H_R >= self.min_child_weight)
-            raw_gains = (G_L ** 2) / (H_L + eps) + (G_R ** 2) / (H_R + eps) - (G_total ** 2) / (H_total + eps)
-            gains = torch.where(valid_era_splits, raw_gains, torch.zeros_like(raw_gains))
-            self.per_era_feature_importance_gpu[:, global_feature_idx] += gains
+            split_feature = local_feature
+        node_kernel.accumulate_feature_importance(
+            gradient_histogram,
+            hessian_histogram,
+            local_feature,
+            best_bin,
+            split_feature,
+            self.min_child_weight,
+            self.L2_reg,
+            self.per_era_feature_importance_gpu,
+            self.threads_per_block,
+        )
         
-        split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
+        split_mask = self.bin_indices[node_indices, split_feature] <= best_bin
         left_indices = node_indices[split_mask]
         right_indices = node_indices[~split_mask]
 
         left_size = left_indices.numel()
         right_size = right_indices.numel()
+        new_depth = depth + 1
+
+        if new_depth == self.max_depth:
+            left_child = self._make_leaf(left_indices, class_k)
+            right_child = self._make_leaf(right_indices, class_k)
+            return {
+                "feature": split_feature,
+                "bin": best_bin,
+                "left": left_child,
+                "right": right_child,
+            }
 
         if left_size <= right_size:
             grad_hist_left, hess_hist_left = self.compute_histograms( left_indices, self.feat_indices_tree )
-            grad_hist_right = gradient_histogram - grad_hist_left
-            hess_hist_right = hessian_histogram - hess_hist_left
+            node_kernel.subtract_histograms_inplace(
+                gradient_histogram,
+                hessian_histogram,
+                grad_hist_left,
+                hess_hist_left,
+                256,
+            )
+            grad_hist_right = gradient_histogram
+            hess_hist_right = hessian_histogram
         else:
             grad_hist_right, hess_hist_right = self.compute_histograms( right_indices, self.feat_indices_tree )
-            grad_hist_left = gradient_histogram - grad_hist_right
-            hess_hist_left = hessian_histogram - hess_hist_right
+            node_kernel.subtract_histograms_inplace(
+                gradient_histogram,
+                hessian_histogram,
+                grad_hist_right,
+                hess_hist_right,
+                256,
+            )
+            grad_hist_left = gradient_histogram
+            hess_hist_left = hessian_histogram
 
-        new_depth = depth + 1
         left_child = self.grow_tree(
             grad_hist_left, hess_hist_left, left_indices, new_depth, class_k
         )
@@ -756,7 +820,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
 
         return {
-            "feature": self.feat_indices_tree[local_feature],
+            "feature": split_feature,
             "bin": best_bin,
             "left": left_child,
             "right": right_child,
@@ -830,6 +894,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
+        can_reuse_root_hessian = (
+            self.era_sorted_for_hist
+            and self.colsample_bytree >= 1.0
+            and self.max_root_era_count > 0
+        )
+        root_hessian_histogram_cache = None
 
         # Ensure forest has enough slots
         if len(self.forest) < self.n_estimators:
@@ -841,9 +911,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
 
-            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
-                self.root_node_indices, self.feat_indices_tree
-            )
+            if can_reuse_root_hessian and root_hessian_histogram_cache is not None:
+                self.root_gradient_histogram = self.compute_root_gradient_histogram_by_era()
+                self.root_hessian_histogram = root_hessian_histogram_cache.clone()
+            else:
+                self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
+                    self.root_node_indices, self.feat_indices_tree
+                )
+                if can_reuse_root_hessian:
+                    root_hessian_histogram_cache = self.root_hessian_histogram.clone()
 
             tree = self.grow_tree(
                 self.root_gradient_histogram,

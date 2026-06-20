@@ -21,14 +21,13 @@ class CudaOptimizationStaticTests(unittest.TestCase):
         self.assertNotIn('printf("Fused directional split kernel launch failed', split)
 
     def test_multi_era_feature_importance_respects_child_weight(self):
-        core = read_source("warpgbm/core.py")
+        split = read_source("warpgbm/cuda/best_split_kernel.cu")
+        start = split.index("__global__ void accumulate_feature_importance_kernel")
+        end = split.index("void launch_accumulate_feature_importance_kernel")
+        importance_kernel = split[start:end]
 
-        self.assertRegex(
-            core,
-            r"valid_era_splits\s*=\s*\(H_L\s*>=\s*self\.min_child_weight\)\s*&\s*"
-            r"\(H_R\s*>=\s*self\.min_child_weight\)",
-        )
-        self.assertIn("gains = torch.where(valid_era_splits", core)
+        self.assertIn("H_L >= min_child_samples && H_R >= min_child_samples", importance_kernel)
+        self.assertIn("gain = (G_L * G_L)", importance_kernel)
 
     def test_fused_split_parallelizes_over_eras_with_shared_reduction(self):
         split = read_source("warpgbm/cuda/best_split_kernel.cu")
@@ -59,6 +58,14 @@ class CudaOptimizationStaticTests(unittest.TestCase):
             r"histogram_global_atomic_kernel<<<blocks,\s*threads>>>",
         )
         self.assertNotRegex(histogram, r"for\s*\(\s*int\s+era_start\s*=\s*0;")
+
+    def test_by_era_histogram_skips_empty_row_tiles(self):
+        histogram = read_source("warpgbm/cuda/histogram_kernel.cu")
+        start = histogram.index("__global__ void histogram_feature_tile_by_era_kernel")
+        end = histogram.index("__global__ void histogram_feature_tile_grad_kernel")
+        by_era_kernel = histogram[start:end]
+
+        self.assertIn("if (row_tile_start >= era_end)", by_era_kernel)
 
 
 if __name__ == "__main__":

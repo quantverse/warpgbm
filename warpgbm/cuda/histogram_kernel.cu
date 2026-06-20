@@ -4,7 +4,7 @@
 #include <climits>
 
 constexpr int ERA_TILE_CAP = 16;
-constexpr int FEATURE_TILE = 16;
+constexpr int FEATURE_TILE = 32;
 
 __global__ void histogram_tiled_configurable_kernel(
     const int8_t *__restrict__ bin_indices, // [N, F_master]
@@ -501,6 +501,7 @@ __global__ void histogram_feature_tile_by_era_kernel(
     float *__restrict__ grad_hist,          // [E * F * B]
     float *__restrict__ hess_hist,          // [E * F * B]
     int64_t F_master, int64_t F, int64_t B,
+    int active_era_start,
     int rows_per_thread)
 {
     int local_f = threadIdx.x % FEATURE_TILE;
@@ -508,10 +509,13 @@ __global__ void histogram_feature_tile_by_era_kernel(
     int row_lanes = blockDim.x / FEATURE_TILE;
     int rows_per_block = row_lanes * rows_per_thread;
     int hist_feat_idx = blockIdx.x * FEATURE_TILE + local_f;
-    int era = blockIdx.z;
+    int era = active_era_start + blockIdx.z;
     int era_start = era_offsets[era];
     int era_end = era_offsets[era + 1];
     int row_tile_start = era_start + blockIdx.y * rows_per_block;
+    if (row_tile_start >= era_end) {
+        return;
+    }
     bool valid_feature = hist_feat_idx < F;
     int feat = valid_feature ? feature_indices[hist_feat_idx] : 0;
 
@@ -709,6 +713,93 @@ __global__ void histogram_feature_tile_grad_kernel(
     }
 }
 
+__global__ void histogram_feature_tile_by_era_grad_kernel(
+    const int8_t *__restrict__ bin_indices, // [N_master, F_master]
+    const float *__restrict__ residuals,    // [N_master]
+    const int32_t *__restrict__ sample_indices, // [N]
+    const int32_t *__restrict__ feature_indices, // [F]
+    const int32_t *__restrict__ era_offsets, // [E + 1], positions in sample_indices
+    float *__restrict__ grad_hist,          // [E * F * B]
+    int64_t F_master, int64_t F, int64_t B,
+    int active_era_start,
+    int rows_per_thread)
+{
+    int local_f = threadIdx.x % FEATURE_TILE;
+    int row_lane = threadIdx.x / FEATURE_TILE;
+    int row_lanes = blockDim.x / FEATURE_TILE;
+    int rows_per_block = row_lanes * rows_per_thread;
+    int hist_feat_idx = blockIdx.x * FEATURE_TILE + local_f;
+    int era = active_era_start + blockIdx.z;
+    int era_start = era_offsets[era];
+    int era_end = era_offsets[era + 1];
+    int row_tile_start = era_start + blockIdx.y * rows_per_block;
+    if (row_tile_start >= era_end) {
+        return;
+    }
+    bool valid_feature = hist_feat_idx < F;
+    int feat = valid_feature ? feature_indices[hist_feat_idx] : 0;
+
+    extern __shared__ float shmem_feature_tile_by_era_grad[];
+    float *sh_grad = shmem_feature_tile_by_era_grad;                // [FEATURE_TILE * B]
+    float *sh_residual = &sh_grad[FEATURE_TILE * B];                // [rows_per_block]
+    int *sh_sample = reinterpret_cast<int *>(&sh_residual[rows_per_block]); // [rows_per_block]
+
+    int hist_values = FEATURE_TILE * B;
+    for (int i = threadIdx.x; i < hist_values; i += blockDim.x) {
+        sh_grad[i] = 0.0f;
+    }
+
+    if (local_f == 0) {
+        for (int r = 0; r < rows_per_thread; ++r)
+        {
+            int local_row = r * row_lanes + row_lane;
+            int row = row_tile_start + local_row;
+            if (row < era_end)
+            {
+                int sample = sample_indices[row];
+                sh_sample[local_row] = sample;
+                sh_residual[local_row] = residuals[sample];
+            }
+            else
+            {
+                sh_sample[local_row] = -1;
+                sh_residual[local_row] = 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (valid_feature) {
+        for (int r = 0; r < rows_per_thread; ++r)
+        {
+            int local_row = r * row_lanes + row_lane;
+            int sample = sh_sample[local_row];
+            if (sample >= 0)
+            {
+                int8_t bin = bin_indices[(int64_t)sample * F_master + feat];
+                if (bin >= 0 && bin < B)
+                {
+                    int sh_idx = local_f * B + bin;
+                    atomicAdd(&sh_grad[sh_idx], sh_residual[local_row]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < hist_values; i += blockDim.x)
+    {
+        int lf = i / B;
+        int bin = i % B;
+        int out_feature = blockIdx.x * FEATURE_TILE + lf;
+        if (out_feature < F)
+        {
+            int64_t idx = (int64_t)era * F * B + out_feature * B + bin;
+            atomicAdd(&grad_hist[idx], sh_grad[i]);
+        }
+    }
+}
+
 __global__ void histogram_feature_tile_root_kernel(
     const int8_t *__restrict__ bin_indices, // [N, F]
     const float *__restrict__ residuals,    // [N]
@@ -895,6 +986,8 @@ void launch_histogram_feature_tile_by_era_kernel(
     at::Tensor &hess_hist,
     int num_bins,
     int max_era_count,
+    int active_era_start,
+    int active_era_end,
     int threads_per_block = 256,
     int rows_per_thread = 1)
 {
@@ -906,12 +999,14 @@ void launch_histogram_feature_tile_by_era_kernel(
     int64_t F = feature_indices.size(0);
     int64_t F_master = bin_indices.size(1);
     int64_t num_eras = era_offsets.size(0) - 1;
+    TORCH_CHECK(active_era_start >= 0 && active_era_end <= num_eras && active_era_start < active_era_end,
+                "active era range must be non-empty and within era_offsets");
     int row_lanes = threads_per_block / FEATURE_TILE;
     int rows_per_block = row_lanes * rows_per_thread;
     int max_era_tiles = (max_era_count + rows_per_block - 1) / rows_per_block;
     int64_t feature_tiles = (F + FEATURE_TILE - 1) / FEATURE_TILE;
 
-    dim3 blocks(feature_tiles, max_era_tiles, num_eras);
+    dim3 blocks(feature_tiles, max_era_tiles, active_era_end - active_era_start);
     dim3 threads(threads_per_block);
 
     int shared_float_count = 2 * FEATURE_TILE * num_bins + rows_per_block;
@@ -927,6 +1022,7 @@ void launch_histogram_feature_tile_by_era_kernel(
         grad_hist.data_ptr<float>(),
         hess_hist.data_ptr<float>(),
         F_master, F, num_bins,
+        active_era_start,
         rows_per_thread);
 
     cudaError_t err = cudaGetLastError();
@@ -981,6 +1077,59 @@ void launch_histogram_feature_tile_grad_kernel(
                 cudaGetErrorString(err));
 }
 
+void launch_histogram_feature_tile_by_era_grad_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &residuals,
+    const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices,
+    const at::Tensor &era_offsets,
+    at::Tensor &grad_hist,
+    int num_bins,
+    int max_era_count,
+    int active_era_start,
+    int active_era_end,
+    int threads_per_block = 256,
+    int rows_per_thread = 1)
+{
+    TORCH_CHECK(threads_per_block % FEATURE_TILE == 0,
+                "threads_per_block must be divisible by ", FEATURE_TILE,
+                " for by-era grad-only feature-tile histogram");
+    TORCH_CHECK(max_era_count > 0, "max_era_count must be positive");
+
+    int64_t F = feature_indices.size(0);
+    int64_t F_master = bin_indices.size(1);
+    int64_t num_eras = era_offsets.size(0) - 1;
+    TORCH_CHECK(active_era_start >= 0 && active_era_end <= num_eras && active_era_start < active_era_end,
+                "active era range must be non-empty and within era_offsets");
+    int row_lanes = threads_per_block / FEATURE_TILE;
+    int rows_per_block = row_lanes * rows_per_thread;
+    int max_era_tiles = (max_era_count + rows_per_block - 1) / rows_per_block;
+    int64_t feature_tiles = (F + FEATURE_TILE - 1) / FEATURE_TILE;
+
+    dim3 blocks(feature_tiles, max_era_tiles, active_era_end - active_era_start);
+    dim3 threads(threads_per_block);
+
+    int shared_float_count = FEATURE_TILE * num_bins + rows_per_block;
+    int shared_int_count = rows_per_block;
+    int shared_mem_bytes = shared_float_count * (int)sizeof(float) + shared_int_count * (int)sizeof(int);
+
+    histogram_feature_tile_by_era_grad_kernel<<<blocks, threads, shared_mem_bytes>>>(
+        bin_indices.data_ptr<int8_t>(),
+        residuals.data_ptr<float>(),
+        sample_indices.data_ptr<int32_t>(),
+        feature_indices.data_ptr<int32_t>(),
+        era_offsets.data_ptr<int32_t>(),
+        grad_hist.data_ptr<float>(),
+        F_master, F, num_bins,
+        active_era_start,
+        rows_per_thread);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "CUDA by-era grad-only feature-tile histogram kernel launch failed: ",
+                cudaGetErrorString(err));
+}
+
 void launch_histogram_feature_tile_root_kernel(
     const at::Tensor &bin_indices,
     const at::Tensor &residuals,
@@ -1021,5 +1170,45 @@ void launch_histogram_feature_tile_root_kernel(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
                 "CUDA root feature-tile histogram kernel launch failed: ",
+                cudaGetErrorString(err));
+}
+
+__global__ void subtract_histograms_inplace_kernel(
+    float *__restrict__ parent_grad,
+    float *__restrict__ parent_hess,
+    const float *__restrict__ child_grad,
+    const float *__restrict__ child_hess,
+    int64_t N)
+{
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        parent_grad[i] -= child_grad[i];
+        parent_hess[i] -= child_hess[i];
+    }
+}
+
+void launch_subtract_histograms_inplace_kernel(
+    at::Tensor &parent_grad,
+    at::Tensor &parent_hess,
+    const at::Tensor &child_grad,
+    const at::Tensor &child_hess,
+    int threads = 256)
+{
+    int64_t N = parent_grad.numel();
+    TORCH_CHECK(parent_hess.numel() == N && child_grad.numel() == N && child_hess.numel() == N,
+                "histogram tensors must have the same number of elements");
+    dim3 blocks((N + threads - 1) / threads);
+    dim3 thread_dims(threads);
+
+    subtract_histograms_inplace_kernel<<<blocks, thread_dims>>>(
+        parent_grad.data_ptr<float>(),
+        parent_hess.data_ptr<float>(),
+        child_grad.data_ptr<float>(),
+        child_hess.data_ptr<float>(),
+        N);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess,
+                "Histogram subtraction kernel launch failed: ",
                 cudaGetErrorString(err));
 }
