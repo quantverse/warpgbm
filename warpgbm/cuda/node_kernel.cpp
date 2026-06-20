@@ -25,6 +25,64 @@ void launch_histogram_kernel_cuda_configurable(
     int threads_per_block = 256,
     int rows_per_thread = 1);
 
+void launch_histogram_feature_major_kernel(
+    const at::Tensor &bin_indices_feature_major,
+    const at::Tensor &residuals,
+    const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices,
+    const at::Tensor &era_indices,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    int num_bins,
+    int threads_per_block = 256,
+    int rows_per_thread = 1);
+
+void launch_histogram_feature_tile_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &residuals,
+    const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices,
+    const at::Tensor &era_indices,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    int num_bins,
+    int threads_per_block = 256,
+    int rows_per_thread = 1);
+
+void launch_histogram_feature_tile_by_era_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &residuals,
+    const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices,
+    const at::Tensor &era_offsets,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    int num_bins,
+    int max_era_count,
+    int threads_per_block = 256,
+    int rows_per_thread = 1);
+
+void launch_histogram_feature_tile_grad_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &residuals,
+    const at::Tensor &sample_indices,
+    const at::Tensor &feature_indices,
+    const at::Tensor &era_indices,
+    at::Tensor &grad_hist,
+    int num_bins,
+    int threads_per_block = 256,
+    int rows_per_thread = 1);
+
+void launch_histogram_feature_tile_root_kernel(
+    const at::Tensor &bin_indices,
+    const at::Tensor &residuals,
+    const at::Tensor &era_indices,
+    at::Tensor &grad_hist,
+    at::Tensor &hess_hist,
+    int num_bins,
+    int threads_per_block = 256,
+    int rows_per_thread = 1);
+
 void launch_directional_split_fused_kernel(
     const at::Tensor &G, // [E, F, B]
     const at::Tensor &H, // [E, F, B]
@@ -51,6 +109,11 @@ void predict_with_forest(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("compute_histogram3", &launch_histogram_kernel_cuda_configurable, "Histogram Feature Shared Mem");
+    m.def("compute_histogram_feature_major", &launch_histogram_feature_major_kernel, "Histogram Feature-Major Layout");
+    m.def("compute_histogram_feature_tile", &launch_histogram_feature_tile_kernel, "Histogram Row-Major Feature Tile");
+    m.def("compute_histogram_feature_tile_by_era", &launch_histogram_feature_tile_by_era_kernel, "By-Era Row-Major Feature Tile");
+    m.def("compute_histogram_feature_tile_grad", &launch_histogram_feature_tile_grad_kernel, "Grad-Only Row-Major Feature Tile");
+    m.def("compute_histogram_feature_tile_root", &launch_histogram_feature_tile_root_kernel, "Root Histogram Row-Major Feature Tile");
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
     m.def("compute_split_fused", &launch_directional_split_fused_kernel, "Best Split Fused (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");

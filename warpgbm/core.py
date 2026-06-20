@@ -21,8 +21,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         n_estimators=100,
         min_child_weight=20,
         min_split_gain=0.0,
-        threads_per_block=64,
-        rows_per_thread=4,
+        threads_per_block=256,
+        rows_per_thread=28,
         L2_reg=1e-6,
         device="cuda",
         colsample_bytree=1.0,
@@ -77,6 +77,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
+        self.era_sorted_for_hist = False
+        self.era_row_boundaries = None
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
 
@@ -131,9 +133,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             raise ValueError(
                 "threads_per_block should be a positive multiple of 32 (warp size)."
             )
-        if not (1 <= kwargs["rows_per_thread"] <= 16):
+        if not (1 <= kwargs["rows_per_thread"] <= 64):
             raise ValueError(
-                "rows_per_thread must be positive between 1 and 16 inclusive."
+                "rows_per_thread must be positive between 1 and 64 inclusive."
             )
         if kwargs["L2_reg"] < 0:
             raise ValueError("L2_reg must be non-negative.")
@@ -362,6 +364,27 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return self._fit_regression(X, y, era_id, X_eval, y_eval,
                                        eval_every_n_trees, early_stopping_rounds, eval_metric)
 
+    def _setup_sorted_era_histogram_boundaries(self, era_id):
+        era_values = np.asarray(era_id)
+        self.era_sorted_for_hist = False
+        self.era_row_boundaries = None
+
+        if era_values.ndim != 1 or era_values.size == 0:
+            return
+        if not np.all(era_values[1:] >= era_values[:-1]):
+            return
+
+        unique_eras = np.unique(era_values)
+        boundaries = np.empty(unique_eras.size + 1, dtype=np.int32)
+        boundaries[:-1] = np.searchsorted(era_values, unique_eras, side="left")
+        boundaries[-1] = era_values.size
+        self.era_row_boundaries = torch.as_tensor(
+            boundaries,
+            device=self.device,
+            dtype=torch.int32,
+        )
+        self.era_sorted_for_hist = True
+
     def _fit_regression(self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric):
         """Original regression fitting logic"""
         # Train data preprocessing
@@ -371,6 +394,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_samples, self.num_features = X.shape
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
+        self._setup_sorted_era_histogram_boundaries(era_id)
         
         # Initialize gradients (predictions)
         if self.warm_start and self._is_fitted and self._trees_trained > 0:
@@ -408,6 +432,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.grow_forest()
 
         del self.bin_indices
+        if hasattr(self, "bin_indices_hist"):
+            del self.bin_indices_hist
         del self.Y_gpu
 
         gc.collect()
@@ -478,6 +504,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.grow_forest_multiclass()
 
         del self.bin_indices
+        if hasattr(self, "bin_indices_hist"):
+            del self.bin_indices_hist
         del self.Y_gpu
 
         gc.collect()
@@ -501,9 +529,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             if is_integer_type and np.all(max_vals < self.num_bins):
                 print("Detected pre-binned integer input — skipping quantile binning.")
-                for f in range(self.num_features):
-                    bin_indices[:,f] = torch.as_tensor( X_np[:, f], device=self.device).contiguous()
-                # bin_indices = X_np.to("cuda", non_blocking=True).contiguous()
+                bin_indices = torch.as_tensor(
+                    np.ascontiguousarray(X_np), device=self.device, dtype=torch.int8
+                ).contiguous()
 
                 # We'll store None or an empty tensor in self.bin_edges
                 # to indicate that we skip binning at predict-time
@@ -541,6 +569,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return bin_indices, era_indices, bin_edges, unique_eras, Y_gpu
 
     def compute_histograms(self, sample_indices, feature_indices):
+        if getattr(self, "era_sorted_for_hist", False):
+            return self.compute_histograms_by_era(sample_indices, feature_indices)
+
         grad_hist = torch.zeros(
             ( self.num_eras, len(feature_indices), self.num_bins), device=self.device, dtype=torch.float32
         )
@@ -548,7 +579,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ( self.num_eras, len(feature_indices), self.num_bins), device=self.device, dtype=torch.float32
         )
 
-        node_kernel.compute_histogram3(
+        node_kernel.compute_histogram_feature_tile(
             self.bin_indices,
             self.residual,
             sample_indices,
@@ -557,6 +588,39 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             grad_hist,
             hess_hist,
             self.num_bins,
+            self.threads_per_block,
+            self.rows_per_thread,
+        )
+        return grad_hist, hess_hist
+
+    def compute_histograms_by_era(self, sample_indices, feature_indices):
+        grad_hist = torch.zeros(
+            (self.num_eras, len(feature_indices), self.num_bins),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        hess_hist = torch.zeros_like(grad_hist)
+
+        era_offsets = torch.searchsorted(
+            sample_indices,
+            self.era_row_boundaries,
+            out_int32=True,
+        )
+        era_counts = era_offsets[1:] - era_offsets[:-1]
+        max_era_count = int(era_counts.max().item())
+        if max_era_count == 0:
+            return grad_hist, hess_hist
+
+        node_kernel.compute_histogram_feature_tile_by_era(
+            self.bin_indices,
+            self.residual,
+            sample_indices,
+            feature_indices,
+            era_offsets,
+            grad_hist,
+            hess_hist,
+            self.num_bins,
+            max_era_count,
             self.threads_per_block,
             self.rows_per_thread,
         )
@@ -647,10 +711,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return {"leaf_value": leaf_value.item(), "samples": parent_size}
         
         # Track feature importance: accumulate per-era gains for the chosen feature
-        global_feature_idx = self.feat_indices_tree[local_feature].item()
+        global_feature_idx = self.feat_indices_tree[local_feature].long()
         if self.num_eras == 1:
             per_era_gains = self.per_era_gain[:, local_feature, best_bin]  # [1]
-            self.per_era_feature_importance_[0, global_feature_idx] += per_era_gains[0].item()
+            self.per_era_feature_importance_gpu[0, global_feature_idx] += per_era_gains[0]
         else:
             # Compute per-era gains from histograms for just this (feature, bin)
             G_hist = gradient_histogram[:, local_feature, :]   # [E, B]
@@ -662,8 +726,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             G_R = G_total - G_L
             H_R = H_total - H_L
             eps = self.L2_reg
-            gains = (G_L ** 2) / (H_L + eps) + (G_R ** 2) / (H_R + eps) - (G_total ** 2) / (H_total + eps)
-            self.per_era_feature_importance_[:, global_feature_idx] += gains.cpu().numpy()
+            valid_era_splits = (H_L >= self.min_child_weight) & (H_R >= self.min_child_weight)
+            raw_gains = (G_L ** 2) / (H_L + eps) + (G_R ** 2) / (H_R + eps) - (G_total ** 2) / (H_total + eps)
+            gains = torch.where(valid_era_splits, raw_gains, torch.zeros_like(raw_gains))
+            self.per_era_feature_importance_gpu[:, global_feature_idx] += gains
         
         split_mask = self.bin_indices[node_indices, self.feat_indices_tree[local_feature]] <= best_bin
         left_indices = node_indices[split_mask]
@@ -735,6 +801,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.training_loss = []
             self.eval_loss = []  # if eval set is given
             self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            self.per_era_feature_importance_gpu = torch.zeros(
+                (self.num_eras, self.num_features),
+                device=self.device,
+                dtype=torch.float32,
+            )
+        elif not hasattr(self, "per_era_feature_importance_gpu"):
+            self.per_era_feature_importance_gpu = torch.as_tensor(
+                self.per_era_feature_importance_,
+                device=self.device,
+                dtype=torch.float32,
+            ).clone()
         
         self.stop = False
 
@@ -764,7 +841,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             if self.colsample_bytree < 1.0:
                 self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
 
-            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms( self.root_node_indices, self.feat_indices_tree )
+            self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
+                self.root_node_indices, self.feat_indices_tree
+            )
 
             tree = self.grow_tree(
                 self.root_gradient_histogram,
@@ -781,6 +860,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 break
 
         # Aggregate feature importance across eras
+        self.per_era_feature_importance_ = (
+            self.per_era_feature_importance_gpu.detach().cpu().numpy()
+        )
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
         
@@ -793,8 +875,19 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.training_loss = []
             self.eval_loss = []
             self.per_era_feature_importance_ = np.zeros((self.num_eras, self.num_features), dtype=np.float32)
+            self.per_era_feature_importance_gpu = torch.zeros(
+                (self.num_eras, self.num_features),
+                device=self.device,
+                dtype=torch.float32,
+            )
             # Store K trees per iteration
             self.forest = []
+        elif not hasattr(self, "per_era_feature_importance_gpu"):
+            self.per_era_feature_importance_gpu = torch.as_tensor(
+                self.per_era_feature_importance_,
+                device=self.device,
+                dtype=torch.float32,
+            ).clone()
         
         self.stop = False
 
@@ -859,6 +952,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 break
 
         # Aggregate feature importance across eras
+        self.per_era_feature_importance_ = (
+            self.per_era_feature_importance_gpu.detach().cpu().numpy()
+        )
         self.feature_importance_ = self.per_era_feature_importance_.sum(axis=0)
         self._is_fitted = True
         

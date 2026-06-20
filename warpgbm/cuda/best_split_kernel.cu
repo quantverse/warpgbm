@@ -82,9 +82,9 @@ void launch_directional_split_kernel(
         per_era_direction.data_ptr<float>());
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Directional split kernel launch failed: %s\n", cudaGetErrorString(err));
-    }
+    TORCH_CHECK(err == cudaSuccess,
+                "Directional split kernel launch failed: ",
+                cudaGetErrorString(err));
 }
 
 // Fused kernel: reduces across eras inside the kernel, outputs [F, B-1] instead of [E, F, B-1].
@@ -100,14 +100,25 @@ __global__ void directional_split_fused_kernel(
     float *__restrict__ fused_agreement         // [F * (B-1)]
 )
 {
-    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    int f = blockIdx.x;
     if (f >= F) return;
 
-    int out_base = f * (B - 1);
+    int split_bins = B - 1;
+    int out_base = f * split_bins;
     float inv_E = 1.0f / (float)E;
 
-    // Accumulate across eras per bin, writing to global memory once
-    for (int e = 0; e < E; ++e) {
+    extern __shared__ float shmem[];
+    float *sh_gain = shmem;                    // [B - 1]
+    float *sh_agreement = &sh_gain[split_bins]; // [B - 1]
+
+    for (int b = threadIdx.x; b < split_bins; b += blockDim.x) {
+        sh_gain[b] = 0.0f;
+        sh_agreement[b] = 0.0f;
+    }
+    __syncthreads();
+
+    // Parallelize across eras within each feature block, reducing into shared memory.
+    for (int e = threadIdx.x; e < E; e += blockDim.x) {
         int base = e * F * B + f * B;
 
         float G_total = 0.0f, H_total = 0.0f;
@@ -117,7 +128,7 @@ __global__ void directional_split_fused_kernel(
         }
 
         float G_L = 0.0f, H_L = 0.0f;
-        for (int b = 0; b < B - 1; ++b) {
+        for (int b = 0; b < split_bins; ++b) {
             G_L += G[base + b];
             H_L += H[base + b];
 
@@ -136,19 +147,15 @@ __global__ void directional_split_fused_kernel(
                 dir = (left_val > right_val) ? 1.0f : -1.0f;
             }
 
-            if (e == 0) {
-                fused_gain[out_base + b]      = gain * inv_E;
-                fused_agreement[out_base + b] = dir * inv_E;
-            } else {
-                fused_gain[out_base + b]      += gain * inv_E;
-                fused_agreement[out_base + b] += dir * inv_E;
-            }
+            atomicAdd(&sh_gain[b], gain * inv_E);
+            atomicAdd(&sh_agreement[b], dir * inv_E);
         }
     }
+    __syncthreads();
 
-    // Apply abs to agreement
-    for (int b = 0; b < B - 1; ++b) {
-        fused_agreement[out_base + b] = fabsf(fused_agreement[out_base + b]);
+    for (int b = threadIdx.x; b < split_bins; b += blockDim.x) {
+        fused_gain[out_base + b] = sh_gain[b];
+        fused_agreement[out_base + b] = fabsf(sh_agreement[b]);
     }
 }
 
@@ -166,10 +173,11 @@ void launch_directional_split_fused_kernel(
     int F = G.size(1);
     int B = G.size(2);
 
-    dim3 blocks((F + threads - 1) / threads);
+    dim3 blocks(F);
     dim3 thread_dims(threads);
+    int shared_mem_bytes = 2 * (B - 1) * (int)sizeof(float);
 
-    directional_split_fused_kernel<<<blocks, thread_dims>>>(
+    directional_split_fused_kernel<<<blocks, thread_dims, shared_mem_bytes>>>(
         G.data_ptr<float>(),
         H.data_ptr<float>(),
         E, F, B,
@@ -180,8 +188,7 @@ void launch_directional_split_fused_kernel(
         fused_agreement.data_ptr<float>());
 
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("Fused directional split kernel launch failed: %s\n", cudaGetErrorString(err));
-    }
+    TORCH_CHECK(err == cudaSuccess,
+                "Fused directional split kernel launch failed: ",
+                cudaGetErrorString(err));
 }
-
