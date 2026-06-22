@@ -187,6 +187,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         for param in ["blind_ratio", "blind_frequency"]:
             if isinstance(kwargs[param], bool):
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
+            if not np.isfinite(kwargs[param]):
+                raise ValueError(f"{param} must be finite, got {kwargs[param]}.")
 
         if not isinstance(kwargs["feature_blinder"], bool):
             raise TypeError(
@@ -390,22 +392,42 @@ class WarpGBM(BaseEstimator, RegressorMixin):
     def _prepare_split_buffers(self, candidate_count):
         split_bins = self.num_bins - 1
         if self.num_eras > 1:
-            self.fused_gain = torch.zeros(
-                candidate_count,
-                split_bins,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            self.fused_agreement = torch.zeros_like(self.fused_gain)
+            expected_shape = (candidate_count, split_bins)
+            if (
+                not hasattr(self, "fused_gain")
+                or not hasattr(self, "fused_agreement")
+                or self.fused_gain.shape != expected_shape
+                or self.fused_agreement.shape != expected_shape
+            ):
+                self.fused_gain = torch.zeros(
+                    candidate_count,
+                    split_bins,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                self.fused_agreement = torch.zeros_like(self.fused_gain)
+            else:
+                self.fused_gain.zero_()
+                self.fused_agreement.zero_()
         else:
-            self.per_era_gain = torch.zeros(
-                1,
-                candidate_count,
-                split_bins,
-                device=self.device,
-                dtype=torch.float32,
-            )
-            self.per_era_direction = torch.zeros_like(self.per_era_gain)
+            expected_shape = (1, candidate_count, split_bins)
+            if (
+                not hasattr(self, "per_era_gain")
+                or not hasattr(self, "per_era_direction")
+                or self.per_era_gain.shape != expected_shape
+                or self.per_era_direction.shape != expected_shape
+            ):
+                self.per_era_gain = torch.zeros(
+                    1,
+                    candidate_count,
+                    split_bins,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                self.per_era_direction = torch.zeros_like(self.per_era_gain)
+            else:
+                self.per_era_gain.zero_()
+                self.per_era_direction.zero_()
 
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric

@@ -38,11 +38,17 @@ def test_feature_blinder_constructor_defaults():
         ({"feature_blinder": "yes"}, TypeError),
         ({"blind_ratio": -0.01}, ValueError),
         ({"blind_ratio": 1.0}, ValueError),
+        ({"blind_ratio": float("nan")}, ValueError),
+        ({"blind_ratio": float("inf")}, ValueError),
+        ({"blind_ratio": float("-inf")}, ValueError),
         ({"blind_ratio": "0.5"}, TypeError),
         ({"blind_ratio": False}, TypeError),
         ({"blind_ratio": True}, TypeError),
         ({"blind_frequency": -0.01}, ValueError),
         ({"blind_frequency": 1.01}, ValueError),
+        ({"blind_frequency": float("nan")}, ValueError),
+        ({"blind_frequency": float("inf")}, ValueError),
+        ({"blind_frequency": float("-inf")}, ValueError),
         ({"blind_frequency": "1.0"}, TypeError),
         ({"blind_frequency": False}, TypeError),
         ({"blind_frequency": True}, TypeError),
@@ -53,6 +59,32 @@ def test_feature_blinder_constructor_defaults():
 def test_feature_blinder_constructor_validation(kwargs, expected_error):
     with pytest.raises(expected_error):
         WarpGBM(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "num_eras, buffer_name",
+    [
+        (1, "per_era_gain"),
+        (2, "fused_gain"),
+    ],
+)
+def test_prepare_split_buffers_reuses_matching_shape_and_reallocates_on_change(
+    num_eras, buffer_name
+):
+    model = WarpGBM(device="cpu", num_bins=10)
+    model.num_eras = num_eras
+
+    model._prepare_split_buffers(candidate_count=4)
+    first_buffer = getattr(model, buffer_name)
+
+    model._prepare_split_buffers(candidate_count=4)
+    matching_buffer = getattr(model, buffer_name)
+
+    model._prepare_split_buffers(candidate_count=3)
+    resized_buffer = getattr(model, buffer_name)
+
+    assert matching_buffer is first_buffer
+    assert resized_buffer is not first_buffer
 
 
 def _configured_helper_model(**kwargs):
