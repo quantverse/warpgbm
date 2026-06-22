@@ -30,6 +30,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         colsample_bytree=1.0,
         random_state=None,
         warm_start=False,
+        feature_blinder=False,
+        blind_ratio=0.0,
+        blind_frequency=1.0,
+        blind_seed=None,
     ):
         # Validate arguments
         self._validate_hyperparams(
@@ -44,6 +48,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             rows_per_thread=rows_per_thread,
             L2_reg=L2_reg,
             colsample_bytree=colsample_bytree,
+            feature_blinder=feature_blinder,
+            blind_ratio=blind_ratio,
+            blind_frequency=blind_frequency,
+            blind_seed=blind_seed,
         )
 
         self.objective = objective
@@ -77,6 +85,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
         self.warm_start = warm_start
+        self.feature_blinder = feature_blinder
+        self.blind_ratio = blind_ratio
+        self.blind_frequency = blind_frequency
+        self.blind_seed = blind_seed
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
@@ -156,6 +168,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "min_split_gain",
             "L2_reg",
             "colsample_bytree",
+            "blind_ratio",
+            "blind_frequency",
         ]
 
         for param in int_params:
@@ -169,6 +183,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 kwargs[param], (float, int)
             ):  # Accept ints as valid floats
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
+
+        if not isinstance(kwargs["feature_blinder"], bool):
+            raise TypeError(
+                f"feature_blinder must be a boolean, got {type(kwargs['feature_blinder'])}."
+            )
+        if kwargs["blind_seed"] is not None:
+            if isinstance(kwargs["blind_seed"], bool) or not isinstance(
+                kwargs["blind_seed"], int
+            ):
+                raise TypeError(
+                    f"blind_seed must be None or an integer, got {type(kwargs['blind_seed'])}."
+                )
 
         if not (2 <= kwargs["num_bins"] <= 127):
             raise ValueError("num_bins must be between 2 and 127 inclusive.")
@@ -195,6 +221,14 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if kwargs["colsample_bytree"] <= 0 or kwargs["colsample_bytree"] > 1:
             raise ValueError(
                 f"Invalid colsample_bytree: {kwargs['colsample_bytree']}. Must be a float value > 0 and <= 1."
+            )
+        if kwargs["blind_ratio"] < 0.0 or kwargs["blind_ratio"] >= 1.0:
+            raise ValueError(
+                f"Invalid blind_ratio: {kwargs['blind_ratio']}. Must be >= 0.0 and < 1.0."
+            )
+        if kwargs["blind_frequency"] < 0.0 or kwargs["blind_frequency"] > 1.0:
+            raise ValueError(
+                f"Invalid blind_frequency: {kwargs['blind_frequency']}. Must be >= 0.0 and <= 1.0."
             )
 
     def _compute_tree_predictions(self, tree, bin_indices):
