@@ -184,6 +184,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ):  # Accept ints as valid floats
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
 
+        for param in ["blind_ratio", "blind_frequency"]:
+            if isinstance(kwargs[param], bool):
+                raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
+
         if not isinstance(kwargs["feature_blinder"], bool):
             raise TypeError(
                 f"feature_blinder must be a boolean, got {type(kwargs['feature_blinder'])}."
