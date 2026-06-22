@@ -306,6 +306,107 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         
         return gradients, hessians
 
+    def _feature_blinder_active(self):
+        return (
+            self.feature_blinder
+            and self.blind_ratio > 0.0
+            and self.blind_frequency > 0.0
+        )
+
+    def _feature_selection_generator(self, round_idx):
+        seed = self.blind_seed if self.blind_seed is not None else self.random_state
+        if seed is None or not self._feature_blinder_active():
+            return None
+
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed) + int(round_idx) * 1_000_003)
+        return generator
+
+    def _select_tree_features(self, round_idx):
+        generator = self._feature_selection_generator(round_idx)
+        generator_kwargs = {"generator": generator} if generator is not None else {}
+
+        if self.colsample_bytree < 1.0:
+            k = max(1, int(self.colsample_bytree * self.num_features))
+            self.feat_indices_tree = torch.randperm(
+                self.num_features,
+                device=self.device,
+                dtype=torch.int32,
+                **generator_kwargs,
+            )[:k]
+        else:
+            self.feat_indices_tree = self.feature_indices
+
+        self.feat_indices_tree = self._blind_feature_candidates(
+            self.feat_indices_tree, generator=generator
+        )
+        return self.feat_indices_tree
+
+    def _blind_feature_candidates(self, candidate_features, generator=None):
+        if not self._feature_blinder_active():
+            return candidate_features
+
+        generator_kwargs = {"generator": generator} if generator is not None else {}
+
+        candidate_count = int(candidate_features.numel())
+        if candidate_count <= 1:
+            return candidate_features
+
+        if self.blind_frequency < 1.0:
+            event = torch.rand((), device=self.device, **generator_kwargs).item()
+            if event >= self.blind_frequency:
+                return candidate_features
+
+        blind_count = min(
+            int(np.floor(self.blind_ratio * candidate_count)),
+            candidate_count - 1,
+        )
+        if blind_count <= 0:
+            return candidate_features
+
+        weights = None
+        if hasattr(self, "per_era_feature_importance_gpu"):
+            weights = self.per_era_feature_importance_gpu.sum(dim=0).to(torch.float32)
+            weights = weights[candidate_features.to(torch.long)].clamp_min(0.0)
+
+        if weights is None or weights.sum().item() <= 0:
+            remove_local = torch.randperm(
+                candidate_count,
+                device=self.device,
+                **generator_kwargs,
+            )[:blind_count]
+        else:
+            remove_local = torch.multinomial(
+                weights + 1e-12,
+                num_samples=blind_count,
+                replacement=False,
+                **generator_kwargs,
+            )
+
+        keep_mask = torch.ones(candidate_count, dtype=torch.bool, device=self.device)
+        keep_mask[remove_local] = False
+        return candidate_features[keep_mask].contiguous()
+
+    def _prepare_split_buffers(self, candidate_count):
+        split_bins = self.num_bins - 1
+        if self.num_eras > 1:
+            self.fused_gain = torch.zeros(
+                candidate_count,
+                split_bins,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self.fused_agreement = torch.zeros_like(self.fused_gain)
+        else:
+            self.per_era_gain = torch.zeros(
+                1,
+                candidate_count,
+                split_bins,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self.per_era_direction = torch.zeros_like(self.per_era_gain)
+
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
     ):
