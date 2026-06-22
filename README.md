@@ -355,6 +355,10 @@ WarpGBM(
     colsample_bytree=1.0,          # Feature subsample ratio per tree
     random_state=None,             # Random seed for reproducibility
     warm_start=False,              # If True, continue training from existing trees
+    feature_blinder=False,         # If True, blind feature candidates during training
+    blind_ratio=0.0,               # Fraction of candidate features to blind per event
+    blind_frequency=1.0,           # Probability of applying blinding each tree
+    blind_seed=None,               # Optional seed for deterministic blinder draws
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
@@ -394,7 +398,29 @@ raw_gains = model.get_feature_importance(normalize=False)   # raw gain values
 
 # Per-era importance (when era_id was used in training)
 per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_eras, n_features)
+```
 
+### Feature Blinder Training
+
+Feature blinding is a training-time regularizer that randomly removes a fraction of current split candidates, weighted toward features that already have high cumulative importance:
+
+```python
+model = WarpGBM(
+    n_estimators=200,
+    max_depth=4,
+    feature_blinder=True,
+    blind_ratio=0.4,
+    blind_frequency=0.8,
+    blind_seed=42,
+)
+model.fit(X_train, y_train, era_id=era_id)
+```
+
+Prediction is unchanged because trained trees still store global feature ids.
+
+### Model Persistence
+
+```python
 # Save and load models
 model.save_model('checkpoint.pkl')  # Saves all model state
 model_loaded = WarpGBM()
