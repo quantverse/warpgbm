@@ -777,18 +777,36 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ( self.num_eras, len(feature_indices), self.num_bins), device=self.device, dtype=torch.float32
         )
 
-        node_kernel.compute_histogram_feature_tile(
-            self.bin_indices,
-            self.residual,
-            sample_indices,
-            feature_indices,
-            self.era_indices,
-            grad_hist,
-            hess_hist,
-            self.num_bins,
-            self.threads_per_block,
-            self.rows_per_thread,
-        )
+        try:
+            node_kernel.compute_histogram_feature_tile(
+                self.bin_indices,
+                self.residual,
+                sample_indices,
+                feature_indices,
+                self.era_indices,
+                grad_hist,
+                hess_hist,
+                self.num_bins,
+                self.threads_per_block,
+                self.rows_per_thread,
+            )
+        except RuntimeError as exc:
+            if "feature-tile histogram kernel launch failed" not in str(exc):
+                raise
+            grad_hist.zero_()
+            hess_hist.zero_()
+            node_kernel.compute_histogram3(
+                self.bin_indices,
+                self.residual,
+                sample_indices,
+                feature_indices,
+                self.era_indices,
+                grad_hist,
+                hess_hist,
+                self.num_bins,
+                self.threads_per_block,
+                self.rows_per_thread,
+            )
         return grad_hist, hess_hist
 
     def compute_histograms_by_era(self, sample_indices, feature_indices):
@@ -943,10 +961,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return self._make_leaf(node_indices, class_k)
         
         # Track feature importance for the chosen feature/bin in one CUDA launch.
-        if self.colsample_bytree < 1.0:
-            split_feature = int(self.feat_indices_tree[local_feature].item())
-        else:
-            split_feature = local_feature
+        split_feature = int(self.feat_indices_tree[local_feature].item())
         node_kernel.accumulate_feature_importance(
             gradient_histogram,
             hessian_histogram,
@@ -1063,24 +1078,12 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         
         self.stop = False
 
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            self.feat_indices_tree = self.feature_indices
-            k = self.num_features
-            
-        if self.num_eras > 1:
-            self.fused_gain = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
-            self.fused_agreement = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        else:
-            self.per_era_gain = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-            self.per_era_direction = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
         can_reuse_root_hessian = (
             self.era_sorted_for_hist
             and self.colsample_bytree >= 1.0
+            and not self._feature_blinder_active()
             and self.max_root_era_count > 0
         )
         root_hessian_histogram_cache = None
@@ -1092,8 +1095,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         for i in range(start_iter, self.n_estimators):
             self.residual = self.Y_gpu - self.gradients
 
-            if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+            self.feat_indices_tree = self._select_tree_features(round_idx=i)
+            self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
 
             if can_reuse_root_hessian and root_hessian_histogram_cache is not None:
                 self.root_gradient_histogram = self.compute_root_gradient_histogram_by_era()

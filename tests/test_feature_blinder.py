@@ -134,3 +134,80 @@ def test_feature_blinder_round_seed_is_reproducible():
         selected_a.detach().cpu().numpy(),
         selected_b.detach().cpu().numpy(),
     )
+
+
+def test_feature_blinder_regression_fit_uses_blinded_candidates():
+    X, y = make_regression(
+        n_samples=240,
+        n_features=8,
+        n_informative=4,
+        noise=0.1,
+        random_state=42,
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    model = WarpGBM(
+        objective="regression",
+        n_estimators=8,
+        max_depth=2,
+        num_bins=16,
+        min_child_weight=2,
+        feature_blinder=True,
+        blind_ratio=0.75,
+        blind_frequency=1.0,
+        blind_seed=42,
+        random_state=42,
+    )
+    model.fit(X, y)
+
+    used_features = set()
+    for tree in model.forest:
+        used_features.update(_tree_features(tree))
+
+    assert model._trees_trained == 8
+    assert used_features
+    assert all(0 <= feature < X.shape[1] for feature in used_features)
+
+
+def test_feature_blinder_disabled_matches_existing_regression_behavior():
+    X, y = make_regression(
+        n_samples=180,
+        n_features=6,
+        n_informative=4,
+        noise=0.1,
+        random_state=11,
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    base = WarpGBM(
+        objective="regression",
+        n_estimators=6,
+        max_depth=2,
+        num_bins=16,
+        min_child_weight=2,
+        colsample_bytree=0.5,
+        random_state=11,
+    )
+    disabled = WarpGBM(
+        objective="regression",
+        n_estimators=6,
+        max_depth=2,
+        num_bins=16,
+        min_child_weight=2,
+        colsample_bytree=0.5,
+        random_state=11,
+        feature_blinder=True,
+        blind_ratio=0.0,
+    )
+
+    base.fit(X, y)
+    disabled.fit(X, y)
+
+    np.testing.assert_allclose(
+        base.predict(X),
+        disabled.predict(X),
+        rtol=1e-3,
+        atol=1e-3,
+    )
