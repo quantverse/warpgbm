@@ -777,36 +777,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             ( self.num_eras, len(feature_indices), self.num_bins), device=self.device, dtype=torch.float32
         )
 
-        try:
-            node_kernel.compute_histogram_feature_tile(
-                self.bin_indices,
-                self.residual,
-                sample_indices,
-                feature_indices,
-                self.era_indices,
-                grad_hist,
-                hess_hist,
-                self.num_bins,
-                self.threads_per_block,
-                self.rows_per_thread,
-            )
-        except RuntimeError as exc:
-            if "feature-tile histogram kernel launch failed" not in str(exc):
-                raise
-            grad_hist.zero_()
-            hess_hist.zero_()
-            node_kernel.compute_histogram3(
-                self.bin_indices,
-                self.residual,
-                sample_indices,
-                feature_indices,
-                self.era_indices,
-                grad_hist,
-                hess_hist,
-                self.num_bins,
-                self.threads_per_block,
-                self.rows_per_thread,
-            )
+        node_kernel.compute_histogram_feature_tile(
+            self.bin_indices,
+            self.residual,
+            sample_indices,
+            feature_indices,
+            self.era_indices,
+            grad_hist,
+            hess_hist,
+            self.num_bins,
+            self.threads_per_block,
+            self.rows_per_thread,
+        )
         return grad_hist, hess_hist
 
     def compute_histograms_by_era(self, sample_indices, feature_indices):

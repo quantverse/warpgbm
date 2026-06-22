@@ -151,7 +151,7 @@ def test_feature_blinder_regression_fit_uses_blinded_candidates():
         objective="regression",
         n_estimators=8,
         max_depth=2,
-        num_bins=16,
+        num_bins=10,
         min_child_weight=2,
         feature_blinder=True,
         blind_ratio=0.75,
@@ -159,6 +159,15 @@ def test_feature_blinder_regression_fit_uses_blinded_candidates():
         blind_seed=42,
         random_state=42,
     )
+    selected_rounds = []
+    original_select_tree_features = model._select_tree_features
+
+    def select_tree_features_spy(round_idx):
+        selected_rounds.append(round_idx)
+        return original_select_tree_features(round_idx)
+
+    model._select_tree_features = select_tree_features_spy
+
     model.fit(X, y)
 
     used_features = set()
@@ -166,6 +175,7 @@ def test_feature_blinder_regression_fit_uses_blinded_candidates():
         used_features.update(_tree_features(tree))
 
     assert model._trees_trained == 8
+    assert selected_rounds == list(range(model._trees_trained))
     assert used_features
     assert all(0 <= feature < X.shape[1] for feature in used_features)
 
@@ -185,7 +195,7 @@ def test_feature_blinder_disabled_matches_existing_regression_behavior():
         objective="regression",
         n_estimators=6,
         max_depth=2,
-        num_bins=16,
+        num_bins=10,
         min_child_weight=2,
         colsample_bytree=0.5,
         random_state=11,
@@ -194,7 +204,7 @@ def test_feature_blinder_disabled_matches_existing_regression_behavior():
         objective="regression",
         n_estimators=6,
         max_depth=2,
-        num_bins=16,
+        num_bins=10,
         min_child_weight=2,
         colsample_bytree=0.5,
         random_state=11,
