@@ -221,3 +221,177 @@ def test_feature_blinder_disabled_matches_existing_regression_behavior():
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+def test_feature_blinder_multiclass_fit_runs():
+    X, y = make_classification(
+        n_samples=240,
+        n_features=8,
+        n_informative=5,
+        n_redundant=0,
+        n_classes=3,
+        random_state=42,
+    )
+    X = X.astype(np.float32)
+
+    model = WarpGBM(
+        objective="multiclass",
+        n_estimators=5,
+        max_depth=2,
+        num_bins=10,
+        min_child_weight=2,
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_frequency=1.0,
+        blind_seed=42,
+        random_state=42,
+    )
+    model.fit(X, y)
+    probabilities = model.predict_proba(X)
+
+    assert model._trees_trained == 5
+    assert probabilities.shape == (X.shape[0], 3)
+    np.testing.assert_allclose(probabilities.sum(axis=1), 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_feature_blinder_warm_start_continues_training():
+    X, y = make_regression(
+        n_samples=180,
+        n_features=6,
+        n_informative=4,
+        noise=0.1,
+        random_state=21,
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    model = WarpGBM(
+        objective="regression",
+        n_estimators=3,
+        max_depth=2,
+        num_bins=10,
+        min_child_weight=2,
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_frequency=1.0,
+        blind_seed=21,
+        random_state=21,
+        warm_start=True,
+    )
+    model.fit(X, y)
+    assert model._trees_trained == 3
+
+    model.n_estimators = 5
+    model.fit(X, y)
+
+    assert model._trees_trained == 5
+    assert len(model.forest) >= 5
+
+
+def test_feature_blinder_reproducible_with_fixed_seed():
+    X, y = make_regression(
+        n_samples=180,
+        n_features=6,
+        n_informative=4,
+        noise=0.1,
+        random_state=31,
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    kwargs = dict(
+        objective="regression",
+        n_estimators=6,
+        max_depth=2,
+        num_bins=10,
+        min_child_weight=2,
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_frequency=1.0,
+        blind_seed=31,
+        random_state=999,
+    )
+
+    model_a = WarpGBM(**kwargs)
+    model_b = WarpGBM(**kwargs)
+    model_a.fit(X, y)
+    model_b.fit(X, y)
+
+    np.testing.assert_allclose(model_a.predict(X), model_b.predict(X), rtol=1e-3, atol=1e-3)
+
+
+def test_feature_blinder_save_load_preserves_parameters(tmp_path):
+    X, y = make_regression(
+        n_samples=120,
+        n_features=5,
+        n_informative=3,
+        noise=0.1,
+        random_state=41,
+    )
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
+    model = WarpGBM(
+        objective="regression",
+        n_estimators=3,
+        max_depth=2,
+        num_bins=10,
+        min_child_weight=2,
+        feature_blinder=True,
+        blind_ratio=0.4,
+        blind_frequency=0.5,
+        blind_seed=123,
+        random_state=41,
+    )
+    model.fit(X, y)
+
+    path = tmp_path / "feature_blinder.pkl"
+    model.save_model(path)
+
+    loaded = WarpGBM()
+    loaded.load_model(path)
+
+    assert loaded.feature_blinder is True
+    assert loaded.blind_ratio == 0.4
+    assert loaded.blind_frequency == 0.5
+    assert loaded.blind_seed == 123
+
+
+def test_feature_blinder_loads_legacy_state_defaults(tmp_path):
+    legacy_state = {
+        "objective": "regression",
+        "num_bins": 10,
+        "max_depth": 3,
+        "learning_rate": 0.1,
+        "n_estimators": 1,
+        "min_child_weight": 20,
+        "min_split_gain": 0.0,
+        "L2_reg": 1e-6,
+        "colsample_bytree": 1.0,
+        "random_state": None,
+        "warm_start": False,
+        "forest": [{}],
+        "bin_edges": None,
+        "base_prediction": 0.0,
+        "num_features": 1,
+        "num_classes": None,
+        "classes_": None,
+        "label_encoder": None,
+        "feature_importance_": None,
+        "per_era_feature_importance_": None,
+        "_is_fitted": True,
+        "_trees_trained": 1,
+        "training_loss": [],
+        "eval_loss": [],
+    }
+    path = tmp_path / "legacy.pkl"
+    with open(path, "wb") as handle:
+        pickle.dump(legacy_state, handle)
+
+    model = WarpGBM()
+    model.load_model(path)
+
+    assert model.feature_blinder is False
+    assert model.blind_ratio == 0.0
+    assert model.blind_frequency == 1.0
+    assert model.blind_seed is None

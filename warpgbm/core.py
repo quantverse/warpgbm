@@ -1132,19 +1132,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         
         self.stop = False
 
-        if self.colsample_bytree < 1.0:
-            k = max(1, int(self.colsample_bytree * self.num_features))
-        else:
-            self.feat_indices_tree = self.feature_indices
-            k = self.num_features
-            
-        if self.num_eras > 1:
-            self.fused_gain = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
-            self.fused_agreement = torch.zeros(k, self.num_bins-1, device=self.device, dtype=torch.float32)
-        else:
-            self.per_era_gain = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-            self.per_era_direction = torch.zeros(1, k, self.num_bins-1, device=self.device, dtype=torch.float32)
-
         # Warm start: start from where we left off
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
@@ -1154,9 +1141,9 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
             # Train K trees (one per class)
             trees_k = []
-            
-            if self.colsample_bytree < 1.0:
-                self.feat_indices_tree = torch.randperm(self.num_features, device=self.device, dtype=torch.int32)[:k]
+
+            self.feat_indices_tree = self._select_tree_features(round_idx=i)
+            self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
             
             for class_k in range(self.num_classes):
                 # Set residual for this class (negative gradient)
@@ -1516,6 +1503,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             'colsample_bytree': self.colsample_bytree,
             'random_state': self.random_state,
             'warm_start': self.warm_start,
+            'feature_blinder': self.feature_blinder,
+            'blind_ratio': self.blind_ratio,
+            'blind_frequency': self.blind_frequency,
+            'blind_seed': self.blind_seed,
             
             # Trained state
             'forest': self._serialize_tree_for_pickle(self.forest),
@@ -1576,6 +1567,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.colsample_bytree = state['colsample_bytree']
         self.random_state = state['random_state']
         self.warm_start = state['warm_start']
+        self.feature_blinder = state.get('feature_blinder', False)
+        self.blind_ratio = state.get('blind_ratio', 0.0)
+        self.blind_frequency = state.get('blind_frequency', 1.0)
+        self.blind_seed = state.get('blind_seed', None)
         
         # Restore trained state
         self.forest = state['forest']
