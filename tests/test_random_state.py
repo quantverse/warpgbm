@@ -85,15 +85,10 @@ def test_random_state_multiclass():
     model2.fit(X, y)
     probs2 = model2.predict_proba(X)
     
-    # Probabilities should be very similar, allowing bounded CUDA histogram/split nondeterminism.
-    prob_diff = np.abs(probs1 - probs2)
-    max_diff = prob_diff.max()
-    mean_diff = prob_diff.mean()
-    assert max_diff <= 6e-2 and mean_diff <= 1e-2, (
-        "Probabilities differ too much "
-        f"(max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f})"
-    )
-    print(f"✓ Multiclass: highly similar predictions with random_state=42 (max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f})")
+    # Probabilities should be very similar (allow slightly more tolerance for multiclass GPU ops)
+    max_diff = np.abs(probs1 - probs2).max()
+    assert np.allclose(probs1, probs2, rtol=1e-2, atol=1e-2), f"Probabilities differ too much (max_diff={max_diff:.6f})"
+    print(f"✓ Multiclass: highly similar predictions with random_state=42 (max_diff={max_diff:.6f})")
     
     # Train model with different random_state
     model3 = WarpGBM(

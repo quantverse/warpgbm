@@ -402,7 +402,7 @@ per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_
 
 ### Feature Blinder Training
 
-Feature blinding is a training-time regularizer that randomly removes a fraction of current split candidates, weighted toward features that already have high cumulative importance:
+Feature blinding is a training-time regularizer that randomly removes a fraction of current split candidates per tree, weighted toward features that already have high cumulative importance. `blind_seed` controls only the blinder draws; `random_state` continues to control `colsample_bytree` feature subsampling.
 
 ```python
 model = WarpGBM(

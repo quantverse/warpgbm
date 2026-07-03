@@ -12,6 +12,8 @@ from torch import Tensor
 import gc
 
 BY_ERA_HISTOGRAM_MIN_ROWS = 3072
+TORCH_SEED_MODULUS = 2**64
+FEATURE_SELECTION_SEED_STRIDE = 1_000_003
 
 class WarpGBM(BaseEstimator, RegressorMixin):
     def __init__(
@@ -95,6 +97,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.era_sorted_for_hist = False
         self.era_row_boundaries = None
         self.max_root_era_count = 0
+        self._feat_indices_are_identity = False
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
 
@@ -195,8 +198,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 f"feature_blinder must be a boolean, got {type(kwargs['feature_blinder'])}."
             )
         if kwargs["blind_seed"] is not None:
-            if isinstance(kwargs["blind_seed"], bool) or not isinstance(
-                kwargs["blind_seed"], int
+            if isinstance(kwargs["blind_seed"], (bool, np.bool_)) or not isinstance(
+                kwargs["blind_seed"], (int, np.integer)
             ):
                 raise TypeError(
                     f"blind_seed must be None or an integer, got {type(kwargs['blind_seed'])}."
@@ -315,34 +318,48 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             and self.blind_frequency > 0.0
         )
 
+    def _seed_for_tree(self, seed, round_idx):
+        return (
+            int(seed) + int(round_idx) * FEATURE_SELECTION_SEED_STRIDE
+        ) % TORCH_SEED_MODULUS
+
     def _feature_selection_generator(self, round_idx):
         seed = self.blind_seed if self.blind_seed is not None else self.random_state
         if seed is None or not self._feature_blinder_active():
             return None
 
         generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed) + int(round_idx) * 1_000_003)
+        generator.manual_seed(self._seed_for_tree(seed, round_idx))
         return generator
 
-    def _select_tree_features(self, round_idx):
-        generator = self._feature_selection_generator(round_idx)
-        generator_kwargs = {"generator": generator} if generator is not None else {}
-
+    def _select_colsample_features(self):
         if self.colsample_bytree < 1.0:
             k = max(1, int(self.colsample_bytree * self.num_features))
-            self.feat_indices_tree = torch.randperm(
+            return torch.randperm(
                 self.num_features,
                 device=self.device,
                 dtype=torch.int32,
-                **generator_kwargs,
             )[:k]
-        else:
-            self.feat_indices_tree = self.feature_indices
 
+        return self.feature_indices
+
+    def _select_tree_features_from_candidates(self, candidate_features, round_idx):
+        blinder_generator = self._feature_selection_generator(round_idx)
         self.feat_indices_tree = self._blind_feature_candidates(
-            self.feat_indices_tree, generator=generator
+            candidate_features, generator=blinder_generator
         )
+        self._feat_indices_are_identity = self.feat_indices_tree is self.feature_indices
         return self.feat_indices_tree
+
+    def _select_tree_features(self, round_idx):
+        return self._select_tree_features_from_candidates(
+            self._select_colsample_features(), round_idx
+        )
+
+    def _global_feature_for_local(self, local_feature):
+        if getattr(self, "_feat_indices_are_identity", False):
+            return int(local_feature)
+        return int(self.feat_indices_tree[local_feature].item())
 
     def _blind_feature_candidates(self, candidate_features, generator=None):
         if not self._feature_blinder_active():
@@ -393,41 +410,62 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         split_bins = self.num_bins - 1
         if self.num_eras > 1:
             expected_shape = (candidate_count, split_bins)
+            capacity_shape = (candidate_count, split_bins)
+            allocated = False
             if (
-                not hasattr(self, "fused_gain")
-                or not hasattr(self, "fused_agreement")
-                or self.fused_gain.shape != expected_shape
-                or self.fused_agreement.shape != expected_shape
+                not hasattr(self, "_fused_gain_buffer")
+                or not hasattr(self, "_fused_agreement_buffer")
+                or self._fused_gain_buffer.shape[0] < candidate_count
+                or self._fused_gain_buffer.shape[1] != split_bins
+                or self._fused_agreement_buffer.shape[0] < candidate_count
+                or self._fused_agreement_buffer.shape[1] != split_bins
             ):
-                self.fused_gain = torch.zeros(
-                    candidate_count,
-                    split_bins,
+                self._fused_gain_buffer = torch.empty(
+                    *capacity_shape,
                     device=self.device,
                     dtype=torch.float32,
                 )
-                self.fused_agreement = torch.zeros_like(self.fused_gain)
-            else:
-                self.fused_gain.zero_()
-                self.fused_agreement.zero_()
+                self._fused_agreement_buffer = torch.empty_like(self._fused_gain_buffer)
+                allocated = True
+
+            if (
+                not allocated
+                and getattr(self, "fused_gain", None) is not None
+                and self.fused_gain.shape == expected_shape
+            ):
+                return
+
+            self.fused_gain = self._fused_gain_buffer[:candidate_count, :]
+            self.fused_agreement = self._fused_agreement_buffer[:candidate_count, :]
         else:
             expected_shape = (1, candidate_count, split_bins)
+            capacity_shape = (1, candidate_count, split_bins)
+            allocated = False
             if (
-                not hasattr(self, "per_era_gain")
-                or not hasattr(self, "per_era_direction")
-                or self.per_era_gain.shape != expected_shape
-                or self.per_era_direction.shape != expected_shape
+                not hasattr(self, "_per_era_gain_buffer")
+                or not hasattr(self, "_per_era_direction_buffer")
+                or self._per_era_gain_buffer.shape[1] < candidate_count
+                or self._per_era_gain_buffer.shape[2] != split_bins
+                or self._per_era_direction_buffer.shape[1] < candidate_count
+                or self._per_era_direction_buffer.shape[2] != split_bins
             ):
-                self.per_era_gain = torch.zeros(
-                    1,
-                    candidate_count,
-                    split_bins,
+                self._per_era_gain_buffer = torch.empty(
+                    *capacity_shape,
                     device=self.device,
                     dtype=torch.float32,
                 )
-                self.per_era_direction = torch.zeros_like(self.per_era_gain)
-            else:
-                self.per_era_gain.zero_()
-                self.per_era_direction.zero_()
+                self._per_era_direction_buffer = torch.empty_like(self._per_era_gain_buffer)
+                allocated = True
+
+            if (
+                not allocated
+                and getattr(self, "per_era_gain", None) is not None
+                and self.per_era_gain.shape == expected_shape
+            ):
+                return
+
+            self.per_era_gain = self._per_era_gain_buffer[:, :candidate_count, :]
+            self.per_era_direction = self._per_era_direction_buffer[:, :candidate_count, :]
 
     def validate_fit_params(
         self, X, y, era_id, X_eval, y_eval, eval_every_n_trees, early_stopping_rounds, eval_metric
@@ -965,7 +1003,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             return self._make_leaf(node_indices, class_k)
         
         # Track feature importance for the chosen feature/bin in one CUDA launch.
-        split_feature = int(self.feat_indices_tree[local_feature].item())
+        split_feature = self._global_feature_for_local(local_feature)
         node_kernel.accumulate_feature_importance(
             gradient_histogram,
             hessian_histogram,
@@ -1087,7 +1125,6 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         can_reuse_root_hessian = (
             self.era_sorted_for_hist
             and self.colsample_bytree >= 1.0
-            and not self._feature_blinder_active()
             and self.max_root_era_count > 0
         )
         root_hessian_histogram_cache = None
@@ -1101,15 +1138,18 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
             self.feat_indices_tree = self._select_tree_features(round_idx=i)
             self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
+            can_reuse_tree_root_hessian = (
+                can_reuse_root_hessian and self._feat_indices_are_identity
+            )
 
-            if can_reuse_root_hessian and root_hessian_histogram_cache is not None:
+            if can_reuse_tree_root_hessian and root_hessian_histogram_cache is not None:
                 self.root_gradient_histogram = self.compute_root_gradient_histogram_by_era()
                 self.root_hessian_histogram = root_hessian_histogram_cache.clone()
             else:
                 self.root_gradient_histogram, self.root_hessian_histogram = self.compute_histograms(
                     self.root_node_indices, self.feat_indices_tree
                 )
-                if can_reuse_root_hessian:
+                if can_reuse_tree_root_hessian:
                     root_hessian_histogram_cache = self.root_hessian_histogram.clone()
 
             tree = self.grow_tree(
@@ -1163,11 +1203,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             
             # Train K trees (one per class)
             trees_k = []
-
-            self.feat_indices_tree = self._select_tree_features(round_idx=i)
-            self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
+            round_candidate_features = self._select_colsample_features()
             
             for class_k in range(self.num_classes):
+                tree_idx = i * self.num_classes + class_k
+                self.feat_indices_tree = self._select_tree_features_from_candidates(
+                    round_candidate_features, round_idx=tree_idx
+                )
+                self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
+
                 # Set residual for this class (negative gradient)
                 self.residual = -grads[:, class_k]
                 

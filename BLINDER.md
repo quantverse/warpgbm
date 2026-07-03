@@ -20,7 +20,7 @@ Their behavior is:
 - `feature_blinder`: enables feature candidate blinding when `True`.
 - `blind_ratio`: fraction of the current candidate set to remove. It must be `>= 0.0` and `< 1.0`.
 - `blind_frequency`: probability of applying a blinding event for a tree. It must be `>= 0.0` and `<= 1.0`.
-- `blind_seed`: optional independent seed for blinder and feature-subsampling draws. If omitted, `random_state` is used when available.
+- `blind_seed`: optional independent seed for blinder draws. If omitted, `random_state` is used when available. Existing `colsample_bytree` feature-subsampling draws remain controlled by `random_state` and PyTorch's active RNG state.
 
 The blinder is active only when all of these are true:
 
@@ -42,7 +42,7 @@ The core implementation lives in `warpgbm/core.py`:
 - `_blind_feature_candidates(candidate_features, generator=None)`
 - `_prepare_split_buffers(candidate_count)`
 
-For each boosting round, WarpGBM builds the feature candidate list in two stages:
+For each tree, WarpGBM builds the feature candidate list in two stages:
 
 1. Apply existing `colsample_bytree` logic.
    - If `colsample_bytree < 1.0`, choose a random subset of feature ids.
@@ -66,15 +66,15 @@ The returned candidate tensor is contiguous and always contains at least one fea
 
 ## Determinism
 
-When `blind_seed` is set, blinder draws are deterministic per boosting round. Otherwise the implementation uses `random_state` when available. The per-round seed is:
+When `blind_seed` is set, blinder draws are deterministic per tree. Otherwise the implementation uses `random_state` when available. The per-tree seed is:
 
 ```python
-seed + round_idx * 1_000_003
+(seed + tree_idx * 1_000_003) % 2**64
 ```
 
-This keeps selection reproducible while avoiding reuse of the exact same random stream for every tree. If neither `blind_seed` nor `random_state` is set, PyTorch's default generator is used.
+This keeps blinder selection reproducible while avoiding reuse of the exact same random stream for every tree. If neither `blind_seed` nor `random_state` is set, PyTorch's default generator is used for blinder draws. Seeded blinder draws do not make the entire CUDA training run bitwise deterministic; histogram and split kernels can still have the same nondeterminism noted for the rest of WarpGBM.
 
-Warm-start training passes the real boosting round index into `_select_tree_features`, so continued training uses the same per-round selection schedule it would have used in uninterrupted training.
+Warm-start regression training passes the real tree index into `_select_tree_features`, so continued training uses the same blinder selection schedule it would have used in uninterrupted training.
 
 ## Native Training Integration
 
@@ -82,7 +82,7 @@ The feature blinder is integrated into the native WarpGBM loops, not layered on 
 
 Regression training calls `_select_tree_features(round_idx=i)` once per tree in `grow_forest()`, then computes root histograms using the selected feature ids.
 
-Multiclass and binary training call `_select_tree_features(round_idx=i)` once per boosting iteration in `grow_forest_multiclass()`. The selected candidate set is shared by the per-class trees for that iteration.
+Multiclass and binary training draw the `colsample_bytree` candidate set once per boosting iteration in `grow_forest_multiclass()`, preserving the existing shared-column subset across class trees. They then call `_select_tree_features_from_candidates(..., round_idx=i * num_classes + class_k)` for each class tree, so only the blinding step can differ across the per-class trees in a boosting iteration.
 
 The selected tensor is stored as:
 
@@ -93,12 +93,12 @@ self.feat_indices_tree
 Histogram kernels receive this tensor and score split candidates in local candidate-index space. `grow_tree()` then maps the winning local feature index back to a global feature id before storing the split, splitting rows, and accumulating feature importance:
 
 ```python
-split_feature = int(self.feat_indices_tree[local_feature].item())
+split_feature = self._global_feature_for_local(local_feature)
 ```
 
 That mapping is important because the blinder can reduce candidates even when `colsample_bytree == 1.0`. Trained trees still store global feature ids, so prediction code does not need to know whether blinding was used.
 
-The root hessian histogram cache is disabled when the blinder is active, because candidate sets can differ by tree. Split scoring buffers are prepared with `_prepare_split_buffers(candidate_count)`, which reuses existing tensors when the shape matches and reallocates when a blinded candidate count changes.
+The root hessian histogram cache is reused only on rounds whose actual selected candidate set is the full identity feature list. Blinded rounds compute their own root histograms. Split scoring buffers are prepared with `_prepare_split_buffers(candidate_count)`, which keeps enough capacity for the largest candidate set seen and reuses views for smaller blinded sets.
 
 ## Persistence
 
