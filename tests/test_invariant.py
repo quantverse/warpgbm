@@ -68,7 +68,8 @@ def test_fit_predictpytee_correlation():
         threads_per_block=128,
         rows_per_thread=4,
         colsample_bytree=0.9,
-        min_child_weight=4
+        min_child_weight=4,
+        random_state=0,
     )
 
     start_fit = time.time()
@@ -97,4 +98,3 @@ def test_fit_predictpytee_correlation():
 
     assert corr > 0.95, f"Out-of-sample correlation too low: {corr:.4f}"
     assert mse < 0.02, f"Out-of-sample MSE too high: {mse:.4f}"
-

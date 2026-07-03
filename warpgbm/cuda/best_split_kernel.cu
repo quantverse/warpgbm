@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 
+constexpr int64_t DEFAULT_DYNAMIC_SHARED_LIMIT = 49152;
+
 __global__ void directional_split_kernel(
     const float *__restrict__ G,                // [E * F * B]
     const float *__restrict__ H,                // [E * F * B]
@@ -259,8 +261,9 @@ __global__ void directional_split_fused_no_atomic_kernel(
     }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
+    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
+        int stride = (active + 1) / 2;
+        if (threadIdx.x < stride && threadIdx.x + stride < active) {
             for (int b = 0; b < split_bins; ++b) {
                 int idx = b * blockDim.x + threadIdx.x;
                 sh_gain[idx] += sh_gain[idx + stride];
@@ -298,6 +301,19 @@ void launch_directional_split_fused_no_atomic_kernel(
     int split_bins = B - 1;
     int shared_mem_bytes = 2 * split_bins * threads * (int)sizeof(float);
 
+    if (shared_mem_bytes > DEFAULT_DYNAMIC_SHARED_LIMIT) {
+        launch_directional_split_fused_kernel(
+            G,
+            H,
+            min_split_gain,
+            min_child_samples,
+            eps,
+            fused_gain,
+            fused_agreement,
+            threads);
+        return;
+    }
+
     directional_split_fused_no_atomic_kernel<<<blocks, thread_dims, shared_mem_bytes>>>(
         G.data_ptr<float>(),
         H.data_ptr<float>(),
@@ -331,33 +347,53 @@ __global__ void select_split_fused_kernel(
     int local_idx = -1;
 
     for (int i = threadIdx.x; i < N; i += blockDim.x) {
-        float gain = fused_gain[i];
-        if (gain > min_split_gain) {
-            float agreement = fused_agreement[i];
-            if (agreement > local_agreement ||
-                (agreement == local_agreement && gain > local_gain)) {
-                local_agreement = agreement;
-                local_gain = gain;
-                local_idx = i;
-            }
+        float agreement = fused_agreement[i];
+        if (agreement > local_agreement) {
+            local_agreement = agreement;
         }
     }
 
     sh_agreement[threadIdx.x] = local_agreement;
+    __syncthreads();
+
+    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
+        int stride = (active + 1) / 2;
+        if (threadIdx.x < stride && threadIdx.x + stride < active) {
+            float other_agreement = sh_agreement[threadIdx.x + stride];
+            if (other_agreement > sh_agreement[threadIdx.x]) {
+                sh_agreement[threadIdx.x] = other_agreement;
+            }
+        }
+        __syncthreads();
+    }
+
+    float max_agreement = sh_agreement[0];
+    local_gain = -FLT_MAX;
+    local_idx = -1;
+
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        float gain = fused_gain[i];
+        float agreement = fused_agreement[i];
+        if (agreement == max_agreement && gain > min_split_gain &&
+            (gain > local_gain || (gain == local_gain && (local_idx < 0 || i < local_idx)))) {
+            local_gain = gain;
+            local_idx = i;
+        }
+    }
+
     sh_gain[threadIdx.x] = local_gain;
     sh_idx[threadIdx.x] = local_idx;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            float other_agreement = sh_agreement[threadIdx.x + stride];
+    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
+        int stride = (active + 1) / 2;
+        if (threadIdx.x < stride && threadIdx.x + stride < active) {
             float other_gain = sh_gain[threadIdx.x + stride];
             int other_idx = sh_idx[threadIdx.x + stride];
             if (other_idx >= 0 &&
-                (other_agreement > sh_agreement[threadIdx.x] ||
-                 (other_agreement == sh_agreement[threadIdx.x] &&
-                  other_gain > sh_gain[threadIdx.x]))) {
-                sh_agreement[threadIdx.x] = other_agreement;
+                (other_gain > sh_gain[threadIdx.x] ||
+                 (other_gain == sh_gain[threadIdx.x] &&
+                  (sh_idx[threadIdx.x] < 0 || other_idx < sh_idx[threadIdx.x])))) {
                 sh_gain[threadIdx.x] = other_gain;
                 sh_idx[threadIdx.x] = other_idx;
             }
@@ -403,10 +439,12 @@ __global__ void accumulate_feature_importance_kernel(
     float min_child_samples,
     float eps,
     float *__restrict__ per_era_feature_importance, // [E * num_features]
+    int importance_eras,
     int num_features)
 {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= E || local_feature < 0 || local_feature >= F ||
+    if (e >= E || e >= importance_eras ||
+        local_feature < 0 || local_feature >= F ||
         best_bin < 0 || best_bin >= B - 1 ||
         global_feature < 0 || global_feature >= num_features) {
         return;
@@ -455,6 +493,7 @@ void launch_accumulate_feature_importance_kernel(
     int E = G.size(0);
     int F = G.size(1);
     int B = G.size(2);
+    int importance_eras = per_era_feature_importance.size(0);
     int num_features = per_era_feature_importance.size(1);
     dim3 blocks((E + threads - 1) / threads);
     dim3 thread_dims(threads);
@@ -469,6 +508,7 @@ void launch_accumulate_feature_importance_kernel(
         min_child_samples,
         eps,
         per_era_feature_importance.data_ptr<float>(),
+        importance_eras,
         num_features);
 
     cudaError_t err = cudaGetLastError();

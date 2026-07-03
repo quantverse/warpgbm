@@ -52,10 +52,10 @@ class CudaOptimizationStaticTests(unittest.TestCase):
         histogram = read_source("warpgbm/cuda/histogram_kernel.cu")
 
         self.assertIn("histogram_global_atomic_kernel", histogram)
-        self.assertIn("if (shared_mem_bytes <= max_shared_bytes)", histogram)
+        self.assertIn("if (shared_mem_bytes <= DEFAULT_DYNAMIC_SHARED_LIMIT)", histogram)
         self.assertRegex(
             histogram,
-            r"histogram_global_atomic_kernel<<<blocks,\s*threads>>>",
+            r"histogram_global_atomic_kernel<<<.*blocks,\s*threads>>>",
         )
         self.assertNotRegex(histogram, r"for\s*\(\s*int\s+era_start\s*=\s*0;")
 

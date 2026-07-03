@@ -86,6 +86,55 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self._is_fitted = False
         self._trees_trained = 0  # Track number of trees already trained
 
+    def _ensure_feature_importance_buffers(self):
+        target_shape = (self.num_eras, self.num_features)
+        current_gpu = getattr(self, "per_era_feature_importance_gpu", None)
+        if current_gpu is not None and tuple(current_gpu.shape) == target_shape:
+            self.per_era_feature_importance_ = current_gpu.detach().cpu().numpy()
+            return
+
+        new_gpu = torch.zeros(target_shape, device=self.device, dtype=torch.float32)
+
+        if current_gpu is not None:
+            rows = min(current_gpu.shape[0], target_shape[0])
+            cols = min(current_gpu.shape[1], target_shape[1])
+            if rows > 0 and cols > 0:
+                new_gpu[:rows, :cols] = current_gpu[:rows, :cols]
+        elif self.per_era_feature_importance_ is not None:
+            source = torch.as_tensor(
+                self.per_era_feature_importance_,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            rows = min(source.shape[0], target_shape[0])
+            cols = min(source.shape[1], target_shape[1])
+            if rows > 0 and cols > 0:
+                new_gpu[:rows, :cols] = source[:rows, :cols]
+
+        self.per_era_feature_importance_gpu = new_gpu
+        self.per_era_feature_importance_ = new_gpu.detach().cpu().numpy()
+
+    def _serialize_tree_for_pickle(self, node):
+        if isinstance(node, list):
+            return [self._serialize_tree_for_pickle(child) for child in node]
+        if not isinstance(node, dict):
+            return node
+
+        serializable = {}
+        for key, value in node.items():
+            if key == "leaf_value" and torch.is_tensor(value):
+                serializable[key] = float(value.detach().cpu().item())
+            elif isinstance(value, dict) or isinstance(value, list):
+                serializable[key] = self._serialize_tree_for_pickle(value)
+            else:
+                serializable[key] = value
+        return serializable
+
+    def _tensor_for_pickle(self, value):
+        if torch.is_tensor(value):
+            return value.detach().cpu()
+        return value
+
     def _validate_hyperparams(self, **kwargs):
         # Validate objective
         if kwargs["objective"] not in ["regression", "multiclass", "binary"]:
@@ -455,6 +504,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_samples, self.num_features = X.shape
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
+        self._setup_sorted_era_histogram_boundaries(era_id)
         
         # Store labels as integers
         self.Y_gpu = torch.from_numpy(y_encoded).to(torch.int32).to(self.device)
@@ -615,8 +665,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.era_row_boundaries,
             out_int32=True,
         )
-        era_counts = era_offsets[1:] - era_offsets[:-1]
-        max_era_count = int(era_counts.max().item())
+        max_era_count = min(int(sample_indices.numel()), int(self.max_root_era_count))
         if max_era_count == 0:
             return grad_hist, hess_hist
 
@@ -870,12 +919,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 device=self.device,
                 dtype=torch.float32,
             )
-        elif not hasattr(self, "per_era_feature_importance_gpu"):
-            self.per_era_feature_importance_gpu = torch.as_tensor(
-                self.per_era_feature_importance_,
-                device=self.device,
-                dtype=torch.float32,
-            ).clone()
+        else:
+            self._ensure_feature_importance_buffers()
         
         self.stop = False
 
@@ -958,12 +1003,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             )
             # Store K trees per iteration
             self.forest = []
-        elif not hasattr(self, "per_era_feature_importance_gpu"):
-            self.per_era_feature_importance_gpu = torch.as_tensor(
-                self.per_era_feature_importance_,
-                device=self.device,
-                dtype=torch.float32,
-            ).clone()
+        else:
+            self._ensure_feature_importance_buffers()
         
         self.stop = False
 
@@ -1353,8 +1394,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             'warm_start': self.warm_start,
             
             # Trained state
-            'forest': self.forest,
-            'bin_edges': self.bin_edges,
+            'forest': self._serialize_tree_for_pickle(self.forest),
+            'bin_edges': self._tensor_for_pickle(self.bin_edges),
             'base_prediction': self.base_prediction,
             'num_features': self.num_features,
             'num_classes': self.num_classes,
@@ -1415,6 +1456,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         # Restore trained state
         self.forest = state['forest']
         self.bin_edges = state['bin_edges']
+        if torch.is_tensor(self.bin_edges) and self.device != "cpu" and torch.cuda.is_available():
+            self.bin_edges = self.bin_edges.to(self.device)
         self.base_prediction = state['base_prediction']
         self.num_features = state['num_features']
         self.num_classes = state['num_classes']
