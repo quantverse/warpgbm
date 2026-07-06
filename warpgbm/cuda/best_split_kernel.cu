@@ -150,15 +150,19 @@ __global__ void directional_split_fused_kernel(
                 dir = (left_val > right_val) ? 1.0f : -1.0f;
             }
 
-            atomicAdd(&sh_gain[b], gain * inv_E);
-            atomicAdd(&sh_agreement[b], dir * inv_E);
+            // Accumulate unscaled: direction sums stay exact integers, so cells with
+            // the same net direction count get bit-identical agreement regardless of
+            // atomic ordering. Scaling per-add would let the exact-equality
+            // agreement mask in select_split_fused drop true tie members.
+            atomicAdd(&sh_gain[b], gain);
+            atomicAdd(&sh_agreement[b], dir);
         }
     }
     __syncthreads();
 
     for (int b = threadIdx.x; b < split_bins; b += blockDim.x) {
-        fused_gain[out_base + b] = sh_gain[b];
-        fused_agreement[out_base + b] = fabsf(sh_agreement[b]);
+        fused_gain[out_base + b] = sh_gain[b] * inv_E;
+        fused_agreement[out_base + b] = fabsf(sh_agreement[b] * inv_E);
     }
 }
 
