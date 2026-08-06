@@ -1,28 +1,30 @@
 # Feature Blinder Implementation
 
-This branch implements feature blinding as a native WarpGBM training-time regularizer. The implementation does not wrap or depend on LightGBM. It applies directly inside the existing GPU tree-building loops by reducing the set of feature candidates considered for each tree.
+This branch implements feature blinding as a native WarpGBM training-time regularizer. It is a port of `LightGbmBlinderTrainer.perturb_data_per_cell`, applied directly to the GPU binned matrix rather than by wrapping LightGBM.
+
+Blinding operates **per cell of the training matrix**. Individual `(row, feature)` cells are overwritten with an uninformative value, so no feature can be counted on to always be observable. Feature-level candidate dropping is *not* what this does — the split-candidate set is controlled by `colsample_bytree` alone.
 
 ## Public API
 
-`WarpGBM` accepts four new constructor parameters:
+`WarpGBM` accepts five blinder parameters:
 
 ```python
 WarpGBM(
     feature_blinder=False,
     blind_ratio=0.0,
     blind_frequency=1.0,
+    blind_every_n_trees=50,
     blind_seed=None,
 )
 ```
 
-Their behavior is:
+- `feature_blinder`: enables per-cell blinding when `True`.
+- `blind_ratio`: base per-cell blinding probability — the `cell_prob` of the reference. Must be `>= 0.0` and `< 1.0`.
+- `blind_frequency`: probability that a redraw event actually blinds. On a miss, training runs on clean data until the next event. Must be `>= 0.0` and `<= 1.0`.
+- `blind_every_n_trees`: how often the mask is redrawn, in trees. The analogue of the reference's `BLIND_STEPS = 1000`. Must be `>= 1`.
+- `blind_seed`: optional independent seed for blinder draws. If omitted, `random_state` is used when available. `colsample_bytree` subsampling remains controlled by `random_state` and PyTorch's active RNG state, and is entirely independent of the blinder.
 
-- `feature_blinder`: enables feature candidate blinding when `True`.
-- `blind_ratio`: fraction of the current candidate set to remove. It must be `>= 0.0` and `< 1.0`.
-- `blind_frequency`: probability of applying a blinding event for a tree. It must be `>= 0.0` and `<= 1.0`.
-- `blind_seed`: optional independent seed for blinder draws. If omitted, `random_state` is used when available. Existing `colsample_bytree` feature-subsampling draws remain controlled by `random_state` and PyTorch's active RNG state.
-
-The blinder is active only when all of these are true:
+The blinder is active only when all of these hold:
 
 ```python
 feature_blinder is True
@@ -30,116 +32,120 @@ blind_ratio > 0.0
 blind_frequency > 0.0
 ```
 
-Validation rejects invalid types, booleans passed as numeric blinder parameters, non-finite ratios/frequencies, out-of-range values, and non-integer `blind_seed` values.
+Validation rejects invalid types, booleans passed as numeric blinder parameters, non-finite ratios/frequencies, out-of-range values, non-positive `blind_every_n_trees`, and non-integer `blind_seed` values.
 
-## Candidate Selection Algorithm
+## Perturbation Algorithm
 
-The core implementation lives in `warpgbm/core.py`:
+The implementation lives in `warpgbm/core.py`:
 
 - `_feature_blinder_active()`
-- `_feature_selection_generator(round_idx)`
-- `_select_tree_features(round_idx)`
-- `_blind_feature_candidates(candidate_features, generator=None)`
-- `_prepare_split_buffers(candidate_count)`
+- `_setup_blinder_buffers()` / `_release_blinder_buffers()`
+- `_blind_bin()`
+- `_blind_cell_probabilities()`
+- `_maybe_blind_cells(round_idx)`
+- `_resync_train_scores()` / `_multiclass_train_scores(bin_indices)`
 
-For each tree, WarpGBM builds the feature candidate list in two stages:
+### Buffers
 
-1. Apply existing `colsample_bytree` logic.
-   - If `colsample_bytree < 1.0`, choose a random subset of feature ids.
-   - Otherwise, use all feature ids.
-2. Optionally blind a subset of those candidates.
-   - Skip if the blinder is inactive.
-   - Skip if there is only one candidate feature.
-   - Draw a blinding event using `blind_frequency`.
-   - Compute `blind_count = floor(blind_ratio * candidate_count)`, capped so at least one candidate remains.
-   - Remove `blind_count` local candidates.
+When the blinder is active, `fit` keeps the pristine binned matrix as `bin_indices_clean` and hands training a working clone in `bin_indices`. The extra `int8` `n_samples × n_features` allocation exists only while the blinder is on and is released at the end of `fit`.
 
-Removal is importance-weighted when feature importance has signal:
+### Redraw
+
+`_maybe_blind_cells(round_idx)` runs at the top of each boosting round and returns early unless:
 
 ```python
-weights = per_era_feature_importance_gpu.sum(dim=0)[candidate_features]
+round_idx > 0 and round_idx % blind_every_n_trees == 0
 ```
 
-The weights are clamped to non-negative values. If the importance tensor is missing or all candidate weights sum to zero, the implementation falls back to uniform random removal. This means early trees can use uniform blinding, and later trees increasingly blind features that have already accumulated high split importance.
+Round 0 is deliberately never blinded. The reference trains a first block of `BLIND_STEPS` rounds on clean data before its first call to `perturb_data_per_cell`, so that every perturbation is weighted by importance the model has actually accumulated. Skipping round 0 reproduces that: the first `blind_every_n_trees` trees fit clean data.
 
-The returned candidate tensor is contiguous and always contains at least one feature.
+When the round qualifies:
+
+1. A `torch.Generator` is seeded from `blind_seed` (falling back to `random_state`) strided by `round_idx`.
+2. The `blind_frequency` event is drawn. On a miss the matrix is restored to clean, training scores are resynced if it had been blinded, and the function returns.
+3. Per-feature probabilities are computed exactly as in the reference:
+
+   ```python
+   fimp = per_era_feature_importance_gpu.sum(dim=0).clamp_min(0.0)
+   fimp = fimp / fimp.max()          # ones(F) if max == 0
+   feature_probs = blind_ratio * fimp
+   ```
+
+   Importance must be read from `per_era_feature_importance_gpu`. On this branch the split-importance accumulation is a CUDA kernel that writes only to that tensor; the `per_era_feature_importance_` numpy mirror is synced once, after the boosting loop, and is all zeros during training. Reading the mirror would silently disable blinding.
+
+   The all-ones fallback mirrors the reference's `if fimp is None` branch. Combined with the round-0 skip it is only reached when the forest has recorded no splits at all.
+4. The working matrix is reset from `bin_indices_clean` and the mask is applied in row chunks:
+
+   ```python
+   draws = torch.rand((chunk_rows, num_features), generator=generator)
+   bin_indices[start:stop].masked_fill_(draws < feature_probs, blind_bin)
+   ```
+
+   Chunking is what keeps this usable at scale. A full-matrix `torch.rand` would need `4 × n_samples × n_features` bytes of scratch — roughly 16 GB on a 2M × 2000 Numerai matrix. `BLIND_RANDOM_CHUNK_ELEMENTS` caps the random buffer at about 256 MB and the fill is in place, so peak memory stays flat in the number of features.
+
+Every redraw starts from `bin_indices_clean`, so perturbations never compound: two consecutive redraws at `blind_ratio=0.3` leave 30% of cells blinded, not 51%.
+
+### Blind Value
+
+A blinded cell is set to the middle bin, `(num_bins - 1) // 2`. Under quantile binning that is the median bin, the closest binned-space analogue of the reference's `value=0.5` on `[0, 1]` features.
+
+### Score Resync
+
+Blinded cells reroute rows through the already-grown trees, so the running prediction state goes stale after a redraw. `_resync_train_scores()` rebuilds it against the current matrix — the equivalent of LightGBM warm-starting a booster on a freshly built `Dataset`:
+
+- Regression: `gradients = predict_binned(bin_indices)`.
+- Multiclass and binary: `gradients = _multiclass_train_scores(bin_indices)`, which is the training class priors `log(prior_k)` plus every stored tree re-predicted on the current matrix.
+
+Without this, residuals would be computed against a matrix the histograms are no longer built from.
+
+`_multiclass_train_scores` also serves the initial score setup in `_fit_classification`, which replaced a hand-rolled prior loop plus a per-tree Python traversal.
+
+### Root Hessian Cache
+
+`grow_forest` caches the root hessian histogram across trees when eras are sorted and `colsample_bytree == 1.0`. Bin counts move when cells move, so a redraw invalidates that cache:
+
+```python
+if self._maybe_blind_cells(i):
+    root_hessian_histogram_cache = None
+```
+
+## Training Integration
+
+Regression (`grow_forest`) and multiclass/binary (`grow_forest_multiclass`) both call `_maybe_blind_cells(i)` at the top of each boosting round, before residuals or softmax gradients are derived from the current scores.
+
+Per-tree feature selection is now `colsample_bytree` only, in `_select_tree_features()`. Multiclass draws that candidate set once per boosting round and shares it across the round's class trees.
+
+Only the training matrix is perturbed. `bin_indices_eval` is built once from `X_eval` and never touched, matching the reference's static validation set. Trained trees store global feature ids and ordinary bin thresholds, so prediction is unaffected by whether blinding was used.
+
+Warm-start resumption re-preprocesses `X` into a clean matrix and rebuilds scores from the stored forest, then re-enters the same global `round_idx % blind_every_n_trees` schedule.
+
+## Cost
+
+A redraw costs one pass over the full matrix plus one full-forest re-prediction. The re-prediction makes total training cost grow with the square of the number of redraws, so `blind_every_n_trees=1` is expensive on large data. The default of 50 keeps it marginal.
 
 ## Determinism
 
-When `blind_seed` is set, blinder draws are deterministic per tree. Otherwise the implementation uses `random_state` when available. The per-tree seed is:
+With `blind_seed` set, the mask for a given round is deterministic. The per-round seed is:
 
 ```python
-(seed + tree_idx * 1_000_003) % 2**64
+(seed + round_idx * BLIND_SEED_STRIDE) % 2**64
 ```
 
-This keeps blinder selection reproducible while avoiding reuse of the exact same random stream for every tree. If neither `blind_seed` nor `random_state` is set, PyTorch's default generator is used for blinder draws. Seeded blinder draws do not make the entire CUDA training run bitwise deterministic; histogram and split kernels can still have the same nondeterminism noted for the rest of WarpGBM.
+Seeded blinder draws do not make the whole CUDA training run bitwise deterministic; the histogram and split kernels retain the nondeterminism documented elsewhere for WarpGBM.
 
-Warm-start regression training passes the real tree index into `_select_tree_features`, so continued training uses the same blinder selection schedule it would have used in uninterrupted training.
+## Relationship to the Reference
 
-## Native Training Integration
+| `LightGbmBlinderTrainer` | This implementation |
+| --- | --- |
+| `cell_prob` | `blind_ratio` |
+| `BLIND_STEPS = 1000` | `blind_every_n_trees` |
+| `fimp / fimp.max()`, `np.ones` when absent | identical, on `per_era_feature_importance_gpu` |
+| `value=0.5` on `[0, 1]` features | middle bin, `(num_bins - 1) // 2` |
+| `X_mod` always derived from `x` | every redraw resets from `bin_indices_clean` |
+| clean rounds before the first perturbation | round 0 skipped |
+| warm start on a new `Dataset` | `_resync_train_scores()` |
+| static `dm_val` | `bin_indices_eval` untouched |
 
-The feature blinder is integrated into the native WarpGBM loops, not layered on top of training data preprocessing.
+`blind_frequency` has no counterpart in `LightGbmBlinderTrainer`; it carries over the `doblind` draw from `ann_utils.gen_batch_blinder_sampling`.
 
-Regression training calls `_select_tree_features(round_idx=i)` once per tree in `grow_forest()`, then computes root histograms using the selected feature ids.
-
-Multiclass and binary training draw the `colsample_bytree` candidate set once per boosting iteration in `grow_forest_multiclass()`, preserving the existing shared-column subset across class trees. They then call `_select_tree_features_from_candidates(..., round_idx=i * num_classes + class_k)` for each class tree, so only the blinding step can differ across the per-class trees in a boosting iteration.
-
-The selected tensor is stored as:
-
-```python
-self.feat_indices_tree
-```
-
-Histogram kernels receive this tensor and score split candidates in local candidate-index space. `grow_tree()` then maps the winning local feature index back to a global feature id before storing the split, splitting rows, and accumulating feature importance:
-
-```python
-split_feature = self._global_feature_for_local(local_feature)
-```
-
-That mapping is important because the blinder can reduce candidates even when `colsample_bytree == 1.0`. Trained trees still store global feature ids, so prediction code does not need to know whether blinding was used.
-
-The root hessian histogram cache is reused only on rounds whose actual selected candidate set is the full identity feature list. Blinded rounds compute their own root histograms. Split scoring buffers are prepared with `_prepare_split_buffers(candidate_count)`, which keeps enough capacity for the largest candidate set seen and reuses views for smaller blinded sets.
-
-## Persistence
-
-`save_model()` stores the new blinder parameters:
-
-- `feature_blinder`
-- `blind_ratio`
-- `blind_frequency`
-- `blind_seed`
-
-`load_model()` restores those fields and uses legacy defaults when loading older model files that do not contain them:
-
-```python
-feature_blinder=False
-blind_ratio=0.0
-blind_frequency=1.0
-blind_seed=None
-```
-
-## Behavior Boundaries
-
-Feature blinding is training-only. It removes split candidates during tree construction; it does not remove columns from input data and does not change prediction traversal.
-
-Disabled settings preserve existing behavior. In particular, `feature_blinder=False`, `blind_ratio=0.0`, or `blind_frequency=0.0` all leave candidate selection equivalent to normal WarpGBM feature sampling.
-
-Blinding happens after `colsample_bytree`, so `blind_ratio` is applied to the already-sampled candidate set rather than to the full feature count.
-
-## Tests
-
-Coverage was added in `tests/test_feature_blinder.py` for:
-
-- constructor defaults and validation
-- numeric edge cases, including booleans, NaN, and infinities
-- candidate selection and one-feature preservation
-- importance-weighted removal and uniform fallback behavior
-- deterministic selection with fixed seeds
-- split-buffer reuse and reallocation
-- regression fit integration
-- disabled behavior parity
-- multiclass fit integration
-- warm-start continuation
-- save/load and legacy load defaults
-
-Related random-state and warm-start tests were also exercised because the feature changes the per-round candidate selection path used by native training.
+The reference's outer early-stopping loop over `EX_TOTAL_ITERS` is not ported. WarpGBM already has `eval_every_n_trees` / `early_stopping_rounds`, which cover the same ground.

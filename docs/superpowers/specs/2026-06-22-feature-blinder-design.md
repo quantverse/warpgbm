@@ -1,5 +1,10 @@
 # Feature Blinder for Training Design
 
+> **SUPERSEDED (2026-08-06).** The candidate-blinding design described below was replaced by
+> per-cell perturbation of the binned training matrix, matching `LightGbmBlinderTrainer`.
+> In particular the Context section's rejection of cell perturbation no longer holds.
+> See `BLINDER.md` for the implemented design.
+
 ## Context
 
 WarpGBM trains histogram-based trees on pre-binned feature tensors. The current training loop already supports per-tree feature candidate selection through `colsample_bytree`: each tree receives `feat_indices_tree`, split search operates on local feature positions, and selected splits are stored as global feature ids. This makes feature-candidate blinding a natural training-time extension.

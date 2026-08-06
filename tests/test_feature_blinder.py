@@ -22,12 +22,73 @@ def _tree_features(tree):
     return features
 
 
+def _clean_matrix(num_samples, num_features, num_bins, device="cpu", seed=0):
+    """A binned matrix in which no cell already holds the blind bin.
+
+    That makes "cell differs from clean" an exact test for "cell was blinded".
+    """
+    blind_bin = (num_bins - 1) // 2
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    matrix = torch.randint(
+        0,
+        num_bins,
+        (num_samples, num_features),
+        device=device,
+        dtype=torch.int8,
+        generator=generator,
+    )
+    matrix[matrix == blind_bin] = (blind_bin + 1) % num_bins
+    return matrix
+
+
+def _blinder_model(
+    num_samples=4096,
+    num_features=8,
+    num_bins=10,
+    device="cpu",
+    importance=None,
+    blind_every_n_trees=1,
+    **kwargs,
+):
+    """A model carrying just enough training state to drive the blinder directly."""
+    model = WarpGBM(
+        device=device,
+        num_bins=num_bins,
+        blind_every_n_trees=blind_every_n_trees,
+        **kwargs,
+    )
+    model.num_samples = num_samples
+    model.num_features = num_features
+    model.num_eras = 1
+    model.feature_indices = torch.arange(num_features, device=device, dtype=torch.int32)
+
+    if importance is None:
+        importance = torch.zeros(num_features, device=device, dtype=torch.float32)
+    model.per_era_feature_importance_gpu = importance.reshape(1, num_features).to(
+        device=device, dtype=torch.float32
+    )
+
+    model.bin_indices = _clean_matrix(num_samples, num_features, num_bins, device=device)
+    model._setup_blinder_buffers()
+    return model
+
+
+def _blinded_fraction_per_feature(model):
+    changed = model.bin_indices != model.bin_indices_clean
+    return changed.to(torch.float32).mean(dim=0).cpu().numpy()
+
+
+# ─────────────────────────── constructor / validation ───────────────────────────
+
+
 def test_feature_blinder_constructor_defaults():
     model = WarpGBM()
 
     assert model.feature_blinder is False
     assert model.blind_ratio == 0.0
     assert model.blind_frequency == 1.0
+    assert model.blind_every_n_trees == 50
     assert model.blind_seed is None
 
 
@@ -52,6 +113,11 @@ def test_feature_blinder_constructor_defaults():
         ({"blind_frequency": "1.0"}, TypeError),
         ({"blind_frequency": False}, TypeError),
         ({"blind_frequency": True}, TypeError),
+        ({"blind_every_n_trees": 0}, ValueError),
+        ({"blind_every_n_trees": -1}, ValueError),
+        ({"blind_every_n_trees": 1.5}, TypeError),
+        ({"blind_every_n_trees": "10"}, TypeError),
+        ({"blind_every_n_trees": True}, TypeError),
         ({"blind_seed": 1.5}, TypeError),
         ({"blind_seed": True}, TypeError),
     ],
@@ -72,18 +138,230 @@ def test_feature_blinder_round_seed_does_not_overflow():
         device="cpu",
         feature_blinder=True,
         blind_ratio=0.25,
-        blind_frequency=1.0,
         blind_seed=2**64 - 1,
     )
-    model.num_features = 4
-    model.feature_indices = torch.arange(4, device=model.device, dtype=torch.int32)
 
-    generator = model._feature_selection_generator(round_idx=1)
-
-    assert generator is not None
+    assert model._blind_generator(round_idx=1) is not None
 
 
-def test_feature_blinder_does_not_drive_colsample_rng():
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"feature_blinder": False, "blind_ratio": 0.5},
+        {"feature_blinder": True, "blind_ratio": 0.0},
+        {"feature_blinder": True, "blind_ratio": 0.5, "blind_frequency": 0.0},
+    ],
+)
+def test_feature_blinder_inactive_combinations(kwargs):
+    assert WarpGBM(device="cpu", **kwargs)._feature_blinder_active() is False
+
+
+# ─────────────────────────── per-cell perturbation ───────────────────────────
+
+
+@pytest.mark.parametrize(
+    "num_bins, expected", [(2, 0), (3, 1), (10, 4), (11, 5), (64, 31), (127, 63)]
+)
+def test_blind_value_is_the_middle_bin(num_bins, expected):
+    assert WarpGBM(device="cpu", num_bins=num_bins)._blind_bin() == expected
+
+
+def test_blinding_writes_only_the_blind_bin():
+    model = _blinder_model(feature_blinder=True, blind_ratio=0.3, blind_seed=11)
+
+    assert model._maybe_blind_cells(round_idx=1) is True
+
+    changed = model.bin_indices != model.bin_indices_clean
+    assert changed.any()
+    assert torch.all(model.bin_indices[changed] == model._blind_bin())
+    # Untouched cells are bit-identical to the clean matrix.
+    assert torch.equal(
+        model.bin_indices[~changed], model.bin_indices_clean[~changed]
+    )
+
+
+@pytest.mark.parametrize("blind_ratio", [0.05, 0.25, 0.6])
+def test_blinded_fraction_matches_blind_ratio_without_importance(blind_ratio):
+    """No importance recorded yet means a uniform blind_ratio, as in the reference."""
+    model = _blinder_model(
+        num_samples=20000, feature_blinder=True, blind_ratio=blind_ratio, blind_seed=3
+    )
+
+    model._maybe_blind_cells(round_idx=1)
+
+    fractions = _blinded_fraction_per_feature(model)
+    np.testing.assert_allclose(fractions, blind_ratio, atol=0.02)
+
+
+def test_blinding_probability_scales_with_normalized_importance():
+    importance = torch.tensor([8.0, 4.0, 2.0, 0.0], dtype=torch.float32)
+    model = _blinder_model(
+        num_samples=20000,
+        num_features=4,
+        importance=importance,
+        feature_blinder=True,
+        blind_ratio=0.4,
+        blind_seed=5,
+    )
+
+    model._maybe_blind_cells(round_idx=1)
+
+    fractions = _blinded_fraction_per_feature(model)
+    # blind_ratio * (importance / importance.max())
+    np.testing.assert_allclose(fractions, [0.4, 0.2, 0.1, 0.0], atol=0.02)
+
+
+def test_blinding_never_compounds_across_redraws():
+    model = _blinder_model(
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_seed=17,
+    )
+
+    model._maybe_blind_cells(round_idx=1)
+    first = _blinded_fraction_per_feature(model).mean()
+
+    model._maybe_blind_cells(round_idx=2)
+    second = _blinded_fraction_per_feature(model).mean()
+
+    # Compounding would push the second redraw toward 1 - (1 - 0.3)**2 = 0.51.
+    np.testing.assert_allclose([first, second], 0.3, atol=0.02)
+    assert model.blind_redraws_ == 2
+
+
+def test_redraws_produce_different_masks():
+    model = _blinder_model(
+        feature_blinder=True, blind_ratio=0.3, blind_seed=23
+    )
+
+    model._maybe_blind_cells(round_idx=1)
+    first = model.bin_indices.clone()
+
+    model._maybe_blind_cells(round_idx=2)
+
+    assert not torch.equal(first, model.bin_indices)
+
+
+def test_redraw_only_fires_on_the_cadence():
+    model = _blinder_model(
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_every_n_trees=5,
+        blind_seed=29,
+    )
+
+    for round_idx in range(5):
+        assert model._maybe_blind_cells(round_idx) is False
+        assert torch.equal(model.bin_indices, model.bin_indices_clean)
+
+    assert model._maybe_blind_cells(round_idx=5) is True
+    after_event = model.bin_indices.clone()
+
+    for round_idx in range(6, 10):
+        assert model._maybe_blind_cells(round_idx) is False
+        assert torch.equal(model.bin_indices, after_event)
+
+    assert model._maybe_blind_cells(round_idx=10) is True
+    assert model.blind_redraws_ == 2
+
+
+def test_inactive_blinder_leaves_matrix_untouched():
+    model = _blinder_model(feature_blinder=False, blind_ratio=0.5)
+
+    assert model.bin_indices_clean is None
+    assert model._maybe_blind_cells(round_idx=1) is False
+
+
+def test_blind_frequency_misses_train_on_clean_data():
+    model = _blinder_model(
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_frequency=0.5,
+        blind_seed=101,
+    )
+
+    blinded_rounds = 0
+    clean_rounds = 0
+    for round_idx in range(1, 41):
+        model._maybe_blind_cells(round_idx)
+        if torch.equal(model.bin_indices, model.bin_indices_clean):
+            clean_rounds += 1
+        else:
+            blinded_rounds += 1
+
+    assert blinded_rounds > 0, "blind_frequency=0.5 should blind on some events"
+    assert clean_rounds > 0, "blind_frequency=0.5 should skip on some events"
+    assert model.blind_redraws_ == blinded_rounds
+
+
+def test_blind_frequency_one_always_blinds():
+    model = _blinder_model(
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_frequency=1.0,
+        blind_seed=7,
+    )
+
+    assert model._maybe_blind_cells(0) is False  # warm-up round is never blinded
+    for round_idx in range(1, 7):
+        assert model._maybe_blind_cells(round_idx) is True
+
+    assert model.blind_redraws_ == 6
+
+
+def test_blind_seed_is_reproducible():
+    def blinded(blind_seed):
+        model = _blinder_model(
+            feature_blinder=True, blind_ratio=0.3, blind_seed=blind_seed
+        )
+        model._maybe_blind_cells(round_idx=1)
+        return model.bin_indices.clone()
+
+    assert torch.equal(blinded(42), blinded(42))
+    assert not torch.equal(blinded(42), blinded(43))
+
+
+def test_blind_seed_falls_back_to_random_state():
+    def blinded(**kwargs):
+        model = _blinder_model(feature_blinder=True, blind_ratio=0.3, **kwargs)
+        model._maybe_blind_cells(round_idx=1)
+        return model.bin_indices.clone()
+
+    assert torch.equal(blinded(random_state=13), blinded(blind_seed=13))
+    # An explicit blind_seed wins over random_state.
+    assert not torch.equal(
+        blinded(random_state=13), blinded(random_state=13, blind_seed=99)
+    )
+
+
+def test_blinding_chunks_cover_every_row():
+    """A feature matrix wider than the chunk budget must still blind all rows."""
+    from warpgbm import core
+
+    original = core.BLIND_RANDOM_CHUNK_ELEMENTS
+    core.BLIND_RANDOM_CHUNK_ELEMENTS = 64  # forces many small chunks
+    try:
+        model = _blinder_model(
+            num_samples=1000,
+            num_features=8,
+            feature_blinder=True,
+            blind_ratio=0.5,
+            blind_seed=31,
+        )
+        model._maybe_blind_cells(round_idx=1)
+    finally:
+        core.BLIND_RANDOM_CHUNK_ELEMENTS = original
+
+    blinded_rows = (model.bin_indices != model.bin_indices_clean).any(dim=1)
+    # With p=0.5 over 8 features, a fully skipped chunk would show as a run of
+    # untouched rows; every 8-row window should contain at least one blinded row.
+    assert blinded_rows.to(torch.float32).mean().item() > 0.9
+
+
+# ─────────────────────────── feature selection is colsample-only ───────────────
+
+
+def test_feature_selection_is_independent_of_blind_seed():
     def selected(random_state, blind_seed):
         torch.manual_seed(random_state)
         model = WarpGBM(
@@ -91,18 +369,42 @@ def test_feature_blinder_does_not_drive_colsample_rng():
             colsample_bytree=0.5,
             random_state=random_state,
             feature_blinder=True,
-            blind_ratio=0.01,
-            blind_frequency=1.0,
+            blind_ratio=0.3,
             blind_seed=blind_seed,
         )
         model.num_features = 10
         model.feature_indices = torch.arange(10, device=model.device, dtype=torch.int32)
-        return model._select_tree_features(round_idx=0).detach().cpu().numpy()
+        return model._select_tree_features().detach().cpu().numpy()
 
     np.testing.assert_array_equal(selected(123, 7), selected(123, 99))
 
     with pytest.raises(AssertionError):
         np.testing.assert_array_equal(selected(123, 7), selected(999, 7))
+
+
+def test_full_colsample_keeps_the_identity_feature_mapping():
+    model = WarpGBM(
+        device="cpu", colsample_bytree=1.0, feature_blinder=True, blind_ratio=0.5
+    )
+    model.num_features = 6
+    model.feature_indices = torch.arange(6, device=model.device, dtype=torch.int32)
+
+    selected = model._select_tree_features()
+
+    assert selected is model.feature_indices
+    assert model._feat_indices_are_identity is True
+
+
+def test_identity_feature_mapping_does_not_read_feature_tensor():
+    class ExplodingFeatureTensor:
+        def __getitem__(self, _):
+            raise AssertionError("identity mapping should not index feat_indices_tree")
+
+    model = WarpGBM(device="cpu")
+    model._feat_indices_are_identity = True
+    model.feat_indices_tree = ExplodingFeatureTensor()
+
+    assert model._global_feature_for_local(3) == 3
 
 
 @pytest.mark.parametrize(
@@ -158,38 +460,32 @@ def test_prepare_split_buffers_does_not_zero_matching_shape():
     assert torch.all(model.per_era_direction == 456.0)
 
 
-def test_identity_feature_mapping_does_not_read_feature_tensor():
-    class ExplodingFeatureTensor:
-        def __getitem__(self, _):
-            raise AssertionError("identity mapping should not index feat_indices_tree")
-
-    model = WarpGBM(device="cpu")
-    model._feat_indices_are_identity = True
-    model.feat_indices_tree = ExplodingFeatureTensor()
-
-    assert model._global_feature_for_local(3) == 3
+# ─────────────────────────── root hessian cache invalidation ───────────────────
 
 
-def test_root_hessian_reuse_survives_skipped_blinding_events():
+def test_redraw_invalidates_the_cached_root_hessian():
     model = WarpGBM(
         device="cpu",
-        n_estimators=4,
+        n_estimators=6,
         num_bins=6,
         colsample_bytree=1.0,
         feature_blinder=True,
         blind_ratio=0.5,
-        blind_frequency=0.5,
+        blind_every_n_trees=3,
         blind_seed=7,
     )
+    model.num_samples = 32
     model.num_features = 6
     model.num_eras = 1
     model.feature_indices = torch.arange(6, device=model.device, dtype=torch.int32)
-    model.root_node_indices = torch.arange(4, device=model.device, dtype=torch.int32)
-    model.Y_gpu = torch.ones(4, device=model.device, dtype=torch.float32)
-    model.gradients = torch.zeros(4, device=model.device, dtype=torch.float32)
+    model.root_node_indices = torch.arange(32, device=model.device, dtype=torch.int32)
+    model.Y_gpu = torch.ones(32, device=model.device, dtype=torch.float32)
+    model.gradients = torch.zeros(32, device=model.device, dtype=torch.float32)
     model.era_sorted_for_hist = True
-    model.max_root_era_count = 4
+    model.max_root_era_count = 32
     model.forest = [{} for _ in range(model.n_estimators)]
+    model.bin_indices = _clean_matrix(32, 6, 6, device=model.device)
+    model._setup_blinder_buffers()
 
     full_histogram_calls = 0
     root_grad_only_calls = 0
@@ -222,474 +518,284 @@ def test_root_hessian_reuse_survives_skipped_blinding_events():
 
     model.compute_histograms = fake_compute_histograms
     model.compute_root_gradient_histogram_by_era = fake_root_gradient_histogram_by_era
-    model.grow_tree = lambda *args, **kwargs: {"leaf_value": torch.tensor(0.0), "samples": 4}
+    model.grow_tree = lambda *args, **kwargs: {
+        "leaf_value": torch.tensor(0.0),
+        "samples": 32,
+    }
     model.compute_eval = lambda _: None
+    model._resync_train_scores = lambda: None
 
     model.grow_forest()
 
+    # Redraws at rounds 0 and 3 each force a full (grad + hess) recompute;
+    # the two rounds after each redraw reuse the cached hessian.
     assert full_histogram_calls == 2
-    assert root_grad_only_calls == 2
+    assert root_grad_only_calls == 4
 
 
-def _configured_helper_model(**kwargs):
-    model = WarpGBM(device="cuda", **kwargs)
-    model.num_features = 4
-    model.num_eras = 1
-    model.feature_indices = torch.arange(4, device=model.device, dtype=torch.int32)
-    model.per_era_feature_importance_gpu = torch.zeros(
-        (1, 4), device=model.device, dtype=torch.float32
-    )
-    return model
+# ─────────────────────────── training integration (CUDA) ───────────────────────
 
 
-def test_feature_blinder_candidate_selection_keeps_one_feature():
-    model = _configured_helper_model(
-        feature_blinder=True,
-        blind_ratio=0.99,
-        blind_frequency=1.0,
-        blind_seed=7,
-    )
-
-    selected = model._select_tree_features(round_idx=0)
-
-    assert selected.numel() == 1
-    assert selected.dtype == torch.int32
-    assert 0 <= int(selected[0].item()) < 4
+def _regression_data(n=4000, f=12, seed=0):
+    X, y = make_regression(n_samples=n, n_features=f, noise=0.1, random_state=seed)
+    return X.astype(np.float32), y.astype(np.float32)
 
 
-def test_feature_blinder_prefers_blinding_important_feature():
-    model = _configured_helper_model(
-        feature_blinder=True,
-        blind_ratio=0.25,
-        blind_frequency=1.0,
-        blind_seed=7,
-    )
-    model.per_era_feature_importance_gpu[0, 1] = 100.0
-
-    selected = model._select_tree_features(round_idx=0).detach().cpu().numpy()
-
-    assert 1 not in selected
-    assert set(selected).issubset({0, 2, 3})
-    assert len(selected) == 3
-
-
-def test_feature_blinder_frequency_zero_preserves_candidates():
-    model = _configured_helper_model(
-        feature_blinder=True,
-        blind_ratio=0.75,
-        blind_frequency=0.0,
-        blind_seed=7,
-    )
-
-    selected = model._select_tree_features(round_idx=0)
-
-    np.testing.assert_array_equal(
-        selected.detach().cpu().numpy(),
-        np.array([0, 1, 2, 3], dtype=np.int32),
-    )
-
-
-def test_feature_blinder_round_seed_is_reproducible():
-    model_a = _configured_helper_model(
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=19,
-    )
-    model_b = _configured_helper_model(
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=19,
-    )
-
-    selected_a = model_a._select_tree_features(round_idx=3)
-    selected_b = model_b._select_tree_features(round_idx=3)
-
-    np.testing.assert_array_equal(
-        selected_a.detach().cpu().numpy(),
-        selected_b.detach().cpu().numpy(),
-    )
-
-
-def test_feature_blinder_regression_fit_uses_blinded_candidates():
-    X, y = make_regression(
-        n_samples=240,
-        n_features=8,
-        n_informative=4,
-        noise=0.1,
-        random_state=42,
-    )
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
+def test_regression_fit_perturbs_cells_and_resyncs_scores():
+    X, y = _regression_data()
+    seen = []
 
     model = WarpGBM(
-        objective="regression",
-        n_estimators=8,
-        max_depth=2,
+        max_depth=3,
+        n_estimators=12,
         num_bins=10,
-        min_child_weight=2,
-        feature_blinder=True,
-        blind_ratio=0.75,
-        blind_frequency=1.0,
-        blind_seed=42,
-        random_state=42,
-    )
-    selected_rounds = []
-    original_select_tree_features = model._select_tree_features
-
-    def select_tree_features_spy(round_idx):
-        selected_rounds.append(round_idx)
-        return original_select_tree_features(round_idx)
-
-    model._select_tree_features = select_tree_features_spy
-
-    model.fit(X, y)
-
-    used_features = set()
-    for tree in model.forest:
-        used_features.update(_tree_features(tree))
-
-    assert model._trees_trained == 8
-    assert selected_rounds == list(range(model._trees_trained))
-    assert used_features
-    assert all(0 <= feature < X.shape[1] for feature in used_features)
-
-
-def test_feature_blinder_disabled_matches_existing_regression_behavior():
-    X, y = make_regression(
-        n_samples=180,
-        n_features=6,
-        n_informative=4,
-        noise=0.1,
-        random_state=11,
-    )
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-
-    base = WarpGBM(
-        objective="regression",
-        n_estimators=6,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
-        colsample_bytree=0.5,
-        random_state=11,
-    )
-    disabled = WarpGBM(
-        objective="regression",
-        n_estimators=6,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
-        colsample_bytree=0.5,
-        random_state=11,
-        feature_blinder=True,
-        blind_ratio=0.0,
-    )
-
-    base.fit(X, y)
-    disabled.fit(X, y)
-
-    np.testing.assert_allclose(
-        base.predict(X),
-        disabled.predict(X),
-        rtol=1e-3,
-        atol=1e-3,
-    )
-
-
-def test_feature_blinder_multiclass_fit_runs():
-    X, y = make_classification(
-        n_samples=240,
-        n_features=8,
-        n_informative=5,
-        n_redundant=0,
-        n_classes=3,
-        random_state=42,
-    )
-    X = X.astype(np.float32)
-
-    model = WarpGBM(
-        objective="multiclass",
-        n_estimators=5,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=42,
-        random_state=42,
-    )
-    model.fit(X, y)
-    probabilities = model.predict_proba(X)
-
-    assert model._trees_trained == 5
-    assert probabilities.shape == (X.shape[0], 3)
-    np.testing.assert_allclose(probabilities.sum(axis=1), 1.0, rtol=1e-5, atol=1e-5)
-
-
-def test_feature_blinder_multiclass_selects_candidates_per_class_tree():
-    model = WarpGBM(
-        objective="multiclass",
-        device="cpu",
-        n_estimators=1,
-        num_bins=6,
-        colsample_bytree=1.0,
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=7,
-    )
-    model.num_classes = 3
-    model.num_features = 6
-    model.num_eras = 1
-    model.feature_indices = torch.arange(6, device=model.device, dtype=torch.int32)
-    model.per_era_feature_importance_gpu = torch.zeros(
-        (1, 6), device=model.device, dtype=torch.float32
-    )
-    model.Y_gpu = torch.tensor([0, 1], device=model.device, dtype=torch.int32)
-    model.gradients = torch.zeros((2, 3), device=model.device, dtype=torch.float32)
-    model.root_node_indices = torch.arange(2, device=model.device, dtype=torch.int32)
-    model.eval_every_n_trees = None
-
-    selected_by_tree = []
-
-    def fake_softmax_gradients_hessians(_):
-        return (
-            torch.zeros((2, 3), device=model.device, dtype=torch.float32),
-            torch.ones((2, 3), device=model.device, dtype=torch.float32),
-        )
-
-    def fake_histograms(_, feature_indices, grad, hess):
-        feature_count = int(feature_indices.numel())
-        return (
-            torch.zeros(
-                (1, feature_count, model.num_bins),
-                device=model.device,
-                dtype=torch.float32,
-            ),
-            torch.ones(
-                (1, feature_count, model.num_bins),
-                device=model.device,
-                dtype=torch.float32,
-            ),
-        )
-
-    def fake_grow_tree(*args, **kwargs):
-        selected_by_tree.append(tuple(model.feat_indices_tree.detach().cpu().tolist()))
-        return {"leaf_value": torch.tensor(0.0), "samples": 2}
-
-    model._compute_softmax_gradients_hessians = fake_softmax_gradients_hessians
-    model.compute_histograms_multiclass = fake_histograms
-    model.grow_tree = fake_grow_tree
-    model.compute_eval_multiclass = lambda _: None
-
-    model.grow_forest_multiclass()
-
-    assert len(selected_by_tree) == 3
-    assert len(set(selected_by_tree)) > 1
-
-
-def test_multiclass_colsample_is_shared_per_round_when_blinder_disabled():
-    model = WarpGBM(
-        objective="multiclass",
-        device="cpu",
-        n_estimators=1,
-        num_bins=6,
-        colsample_bytree=0.5,
-        feature_blinder=False,
-    )
-    model.num_classes = 3
-    model.num_features = 8
-    model.num_eras = 1
-    model.feature_indices = torch.arange(8, device=model.device, dtype=torch.int32)
-    model.per_era_feature_importance_gpu = torch.zeros(
-        (1, 8), device=model.device, dtype=torch.float32
-    )
-    model.Y_gpu = torch.tensor([0, 1], device=model.device, dtype=torch.int32)
-    model.gradients = torch.zeros((2, 3), device=model.device, dtype=torch.float32)
-    model.root_node_indices = torch.arange(2, device=model.device, dtype=torch.int32)
-    model.eval_every_n_trees = None
-
-    selected_by_tree = []
-
-    def fake_softmax_gradients_hessians(_):
-        return (
-            torch.zeros((2, 3), device=model.device, dtype=torch.float32),
-            torch.ones((2, 3), device=model.device, dtype=torch.float32),
-        )
-
-    def fake_histograms(_, feature_indices, grad, hess):
-        feature_count = int(feature_indices.numel())
-        return (
-            torch.zeros(
-                (1, feature_count, model.num_bins),
-                device=model.device,
-                dtype=torch.float32,
-            ),
-            torch.ones(
-                (1, feature_count, model.num_bins),
-                device=model.device,
-                dtype=torch.float32,
-            ),
-        )
-
-    def fake_grow_tree(*args, **kwargs):
-        selected_by_tree.append(tuple(model.feat_indices_tree.detach().cpu().tolist()))
-        return {"leaf_value": torch.tensor(0.0), "samples": 2}
-
-    model._compute_softmax_gradients_hessians = fake_softmax_gradients_hessians
-    model.compute_histograms_multiclass = fake_histograms
-    model.grow_tree = fake_grow_tree
-    model.compute_eval_multiclass = lambda _: None
-
-    torch.manual_seed(123)
-    model.grow_forest_multiclass()
-
-    assert len(selected_by_tree) == 3
-    assert selected_by_tree[0] == selected_by_tree[1] == selected_by_tree[2]
-
-
-def test_feature_blinder_warm_start_continues_training():
-    X, y = make_regression(
-        n_samples=180,
-        n_features=6,
-        n_informative=4,
-        noise=0.1,
-        random_state=21,
-    )
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-
-    model = WarpGBM(
-        objective="regression",
-        n_estimators=3,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=21,
-        random_state=21,
-        warm_start=True,
-    )
-    model.fit(X, y)
-    assert model._trees_trained == 3
-
-    model.n_estimators = 5
-    model.fit(X, y)
-
-    assert model._trees_trained == 5
-    assert len(model.forest) >= 5
-
-
-def test_feature_blinder_reproducible_with_fixed_seed():
-    X, y = make_regression(
-        n_samples=180,
-        n_features=6,
-        n_informative=4,
-        noise=0.1,
-        random_state=31,
-    )
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-
-    kwargs = dict(
-        objective="regression",
-        n_estimators=6,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
-        feature_blinder=True,
-        blind_ratio=0.5,
-        blind_frequency=1.0,
-        blind_seed=31,
-        random_state=999,
-    )
-
-    model_a = WarpGBM(**kwargs)
-    model_b = WarpGBM(**kwargs)
-    model_a.fit(X, y)
-    model_b.fit(X, y)
-
-    np.testing.assert_allclose(model_a.predict(X), model_b.predict(X), rtol=1e-3, atol=1e-3)
-
-
-def test_feature_blinder_save_load_preserves_parameters(tmp_path):
-    X, y = make_regression(
-        n_samples=120,
-        n_features=5,
-        n_informative=3,
-        noise=0.1,
-        random_state=41,
-    )
-    X = X.astype(np.float32)
-    y = y.astype(np.float32)
-
-    model = WarpGBM(
-        objective="regression",
-        n_estimators=3,
-        max_depth=2,
-        num_bins=10,
-        min_child_weight=2,
         feature_blinder=True,
         blind_ratio=0.4,
-        blind_frequency=0.5,
-        blind_seed=123,
-        random_state=41,
+        blind_every_n_trees=4,
+        blind_seed=42,
+        random_state=42,
     )
+
+    original_resync = model._resync_train_scores
+
+    def recording_resync():
+        original_resync()
+        if model._trees_trained > 0:
+            expected = model.predict_binned(model.bin_indices)
+            seen.append(torch.allclose(model.gradients, expected, atol=1e-5))
+
+    model._resync_train_scores = recording_resync
     model.fit(X, y)
 
-    path = tmp_path / "feature_blinder.pkl"
-    model.save_model(path)
+    assert model.blind_redraws_ == 2  # rounds 4 and 8; round 0 is the warm-up
+    assert seen and all(seen), "scores must track the perturbed matrix after a redraw"
 
-    loaded = WarpGBM()
-    loaded.load_model(path)
+    preds = model.predict(X)
+    assert preds.shape == (X.shape[0],)
+    assert np.all(np.isfinite(preds))
+
+    features = _tree_features(model.forest[: model._trees_trained])
+    assert features
+    assert all(0 <= int(f) < X.shape[1] for f in features)
+
+
+def test_regression_blinding_changes_the_fitted_forest():
+    X, y = _regression_data()
+    common = dict(max_depth=3, n_estimators=15, num_bins=10, random_state=7)
+
+    plain = WarpGBM(**common).fit(X, y)
+    blinded = WarpGBM(
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_every_n_trees=5,
+        blind_seed=7,
+        **common,
+    ).fit(X, y)
+
+    assert blinded.blind_redraws_ == 2  # rounds 5 and 10
+    assert not np.allclose(plain.predict(X), blinded.predict(X))
+
+
+def test_disabled_blinder_matches_baseline_training():
+    X, y = _regression_data()
+    common = dict(max_depth=3, n_estimators=10, num_bins=10, random_state=5)
+
+    baseline = WarpGBM(**common).fit(X, y)
+    disabled = WarpGBM(
+        feature_blinder=False, blind_ratio=0.5, blind_every_n_trees=2, **common
+    ).fit(X, y)
+
+    assert disabled.blind_redraws_ == 0
+    np.testing.assert_allclose(baseline.predict(X), disabled.predict(X), atol=1e-5)
+
+
+def test_training_matrices_are_released_after_fit():
+    X, y = _regression_data(n=1000, f=8)
+
+    model = WarpGBM(
+        n_estimators=4,
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_every_n_trees=2,
+        blind_seed=1,
+    ).fit(X, y)
+
+    assert model.bin_indices_clean is None
+    assert not hasattr(model, "bin_indices")
+
+
+def test_eval_matrix_is_not_blinded():
+    X, y = _regression_data(n=2000, f=8)
+    X_eval, y_eval = _regression_data(n=500, f=8, seed=1)
+
+    model = WarpGBM(
+        n_estimators=6,
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_every_n_trees=2,
+        blind_seed=3,
+    )
+    model.fit(X, y, X_eval=X_eval, y_eval=y_eval, eval_every_n_trees=2)
+
+    expected = model.bin_inference_data(X_eval)
+    assert torch.equal(model.bin_indices_eval, expected)
+
+
+def test_multiclass_fit_with_blinder():
+    X, y = make_classification(
+        n_samples=3000,
+        n_features=12,
+        n_informative=8,
+        n_classes=3,
+        random_state=0,
+    )
+    X = X.astype(np.float32)
+
+    model = WarpGBM(
+        objective="multiclass",
+        max_depth=3,
+        n_estimators=9,
+        num_bins=10,
+        feature_blinder=True,
+        blind_ratio=0.4,
+        blind_every_n_trees=3,
+        blind_seed=11,
+        random_state=11,
+    ).fit(X, y)
+
+    assert model.blind_redraws_ == 2  # rounds 3 and 6
+    probs = model.predict_proba(X)
+    assert probs.shape == (X.shape[0], 3)
+    assert np.all(np.isfinite(probs))
+    np.testing.assert_allclose(probs.sum(axis=1), 1.0, atol=1e-5)
+
+    features = _tree_features(model.forest)
+    assert features
+    assert all(0 <= int(f) < X.shape[1] for f in features)
+
+
+def test_multiclass_round_shares_one_candidate_set():
+    X, y = make_classification(
+        n_samples=1500,
+        n_features=10,
+        n_informative=6,
+        n_classes=3,
+        random_state=2,
+    )
+    X = X.astype(np.float32)
+
+    model = WarpGBM(
+        objective="multiclass",
+        n_estimators=3,
+        colsample_bytree=0.5,
+        feature_blinder=True,
+        blind_ratio=0.4,
+        blind_every_n_trees=1,
+        blind_seed=2,
+        random_state=2,
+    )
+
+    per_round_selections = []
+    original_select = model._select_tree_features
+
+    def recording_select():
+        selected = original_select()
+        per_round_selections.append(selected.detach().cpu().numpy().copy())
+        return selected
+
+    model._select_tree_features = recording_select
+    model.fit(X, y)
+
+    # One draw per boosting round, not per class tree.
+    assert len(per_round_selections) == model._trees_trained
+
+
+def test_warm_start_continues_training_with_blinder():
+    X, y = _regression_data(n=2000, f=10)
+
+    model = WarpGBM(
+        n_estimators=6,
+        warm_start=True,
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_every_n_trees=3,
+        blind_seed=4,
+        random_state=4,
+    )
+    model.fit(X, y)
+    assert model._trees_trained == 6
+
+    model.n_estimators = 12
+    model.fit(X, y)
+
+    assert model._trees_trained == 12
+    preds = model.predict(X)
+    assert np.all(np.isfinite(preds))
+
+
+def test_fit_is_reproducible_with_a_fixed_blind_seed():
+    X, y = _regression_data(n=2000, f=10)
+
+    def fitted():
+        return WarpGBM(
+            n_estimators=8,
+            feature_blinder=True,
+            blind_ratio=0.4,
+            blind_every_n_trees=2,
+            blind_seed=99,
+            random_state=99,
+        ).fit(X, y).predict(X)
+
+    np.testing.assert_allclose(fitted(), fitted(), atol=1e-5)
+
+
+# ─────────────────────────── persistence ───────────────────────────
+
+
+def test_save_load_preserves_blinder_parameters(tmp_path):
+    X, y = _regression_data(n=1000, f=8)
+
+    model = WarpGBM(
+        n_estimators=4,
+        feature_blinder=True,
+        blind_ratio=0.35,
+        blind_frequency=0.7,
+        blind_every_n_trees=2,
+        blind_seed=21,
+    ).fit(X, y)
+
+    path = tmp_path / "model.pkl"
+    model.save_model(str(path))
+
+    loaded = WarpGBM().load_model(str(path))
 
     assert loaded.feature_blinder is True
-    assert loaded.blind_ratio == 0.4
-    assert loaded.blind_frequency == 0.5
-    assert loaded.blind_seed == 123
+    assert loaded.blind_ratio == 0.35
+    assert loaded.blind_frequency == 0.7
+    assert loaded.blind_every_n_trees == 2
+    assert loaded.blind_seed == 21
+    np.testing.assert_allclose(model.predict(X), loaded.predict(X), atol=1e-5)
 
 
-def test_feature_blinder_loads_legacy_state_defaults(tmp_path):
-    legacy_state = {
-        "objective": "regression",
-        "num_bins": 10,
-        "max_depth": 3,
-        "learning_rate": 0.1,
-        "n_estimators": 1,
-        "min_child_weight": 20,
-        "min_split_gain": 0.0,
-        "L2_reg": 1e-6,
-        "colsample_bytree": 1.0,
-        "random_state": None,
-        "warm_start": False,
-        "forest": [{}],
-        "bin_edges": None,
-        "base_prediction": 0.0,
-        "num_features": 1,
-        "num_classes": None,
-        "classes_": None,
-        "label_encoder": None,
-        "feature_importance_": None,
-        "per_era_feature_importance_": None,
-        "_is_fitted": True,
-        "_trees_trained": 1,
-        "training_loss": [],
-        "eval_loss": [],
-    }
+def test_load_defaults_blinder_parameters_for_legacy_state(tmp_path):
+    X, y = _regression_data(n=1000, f=8)
+    model = WarpGBM(n_estimators=4).fit(X, y)
+
     path = tmp_path / "legacy.pkl"
+    model.save_model(str(path))
+
+    with open(path, "rb") as handle:
+        state = pickle.load(handle)
+    for key in ("feature_blinder", "blind_ratio", "blind_frequency",
+                "blind_every_n_trees", "blind_seed"):
+        state.pop(key, None)
     with open(path, "wb") as handle:
-        pickle.dump(legacy_state, handle)
+        pickle.dump(state, handle)
 
-    model = WarpGBM()
-    model.load_model(path)
+    loaded = WarpGBM().load_model(str(path))
 
-    assert model.feature_blinder is False
-    assert model.blind_ratio == 0.0
-    assert model.blind_frequency == 1.0
-    assert model.blind_seed is None
+    assert loaded.feature_blinder is False
+    assert loaded.blind_ratio == 0.0
+    assert loaded.blind_frequency == 1.0
+    assert loaded.blind_every_n_trees == 50
+    assert loaded.blind_seed is None

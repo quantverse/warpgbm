@@ -355,9 +355,10 @@ WarpGBM(
     colsample_bytree=1.0,          # Feature subsample ratio per tree
     random_state=None,             # Random seed for reproducibility
     warm_start=False,              # If True, continue training from existing trees
-    feature_blinder=False,         # If True, blind feature candidates during training
-    blind_ratio=0.0,               # Fraction of candidate features to blind per event
-    blind_frequency=1.0,           # Probability of applying blinding each tree
+    feature_blinder=False,         # If True, blind individual cells during training
+    blind_ratio=0.0,               # Base per-cell blinding probability
+    blind_frequency=1.0,           # Probability a redraw event actually blinds
+    blind_every_n_trees=50,        # Redraw the blinding mask every N trees
     blind_seed=None,               # Optional seed for deterministic blinder draws
     threads_per_block=64,          # CUDA block size (tune for your GPU)
     rows_per_thread=4,             # Rows processed per thread
@@ -402,21 +403,26 @@ per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_
 
 ### Feature Blinder Training
 
-Feature blinding is a training-time regularizer that randomly removes a fraction of current split candidates per tree, weighted toward features that already have high cumulative importance. `blind_seed` controls only the blinder draws; `random_state` continues to control `colsample_bytree` feature subsampling.
+Feature blinding is a training-time regularizer that overwrites **individual cells** of the training matrix with an uninformative value, so the forest cannot lean on any single feature always being observable. Each cell of feature `f` is blinded with probability `blind_ratio × importance[f] / max(importance)`, which concentrates the damage on the features the forest already relies on most.
+
+Every `blind_every_n_trees` trees the mask is redrawn from the pristine matrix, so perturbations never compound, and the accumulated training predictions are recomputed against the new matrix. `blind_seed` controls only the blinder draws; `random_state` continues to control `colsample_bytree` feature subsampling.
 
 ```python
 model = WarpGBM(
-    n_estimators=200,
+    n_estimators=2000,
     max_depth=4,
     feature_blinder=True,
-    blind_ratio=0.4,
-    blind_frequency=0.8,
+    blind_ratio=0.1,          # ~10% of cells blinded on the most important feature
+    blind_frequency=0.8,      # 20% of redraw events train on clean data instead
+    blind_every_n_trees=50,
     blind_seed=42,
 )
 model.fit(X_train, y_train, era_id=era_id)
 ```
 
-Prediction is unchanged because trained trees still store global feature ids.
+Blinded cells are set to the middle bin, `(num_bins - 1) // 2`, which under quantile binning is the median. Only the training matrix is perturbed — any `X_eval` you pass stays clean, and prediction is unaffected.
+
+A redraw costs one pass over the `n_samples × n_features` matrix plus one full-forest re-prediction, so lower `blind_every_n_trees` values get expensive on large data. Start at the default of 50 and tune from there.
 
 ### Model Persistence
 

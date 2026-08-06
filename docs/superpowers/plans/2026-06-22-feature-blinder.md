@@ -1,5 +1,8 @@
 # Feature Blinder Implementation Plan
 
+> **SUPERSEDED (2026-08-06).** This plan built per-tree candidate blinding, which was
+> replaced by per-cell matrix perturbation. See `BLINDER.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add optional WarpGBM-native feature blinding that removes high-importance features from per-tree split candidates during training.

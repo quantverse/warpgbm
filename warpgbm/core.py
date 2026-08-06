@@ -13,7 +13,10 @@ import gc
 
 BY_ERA_HISTOGRAM_MIN_ROWS = 3072
 TORCH_SEED_MODULUS = 2**64
-FEATURE_SELECTION_SEED_STRIDE = 1_000_003
+BLIND_SEED_STRIDE = 1_000_003
+# Cap on the random buffer drawn per blinding chunk (~256 MB of float32), so a
+# redraw over a billion-cell matrix does not need a billion-cell scratch tensor.
+BLIND_RANDOM_CHUNK_ELEMENTS = 1 << 26
 
 class WarpGBM(BaseEstimator, RegressorMixin):
     def __init__(
@@ -35,6 +38,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         feature_blinder=False,
         blind_ratio=0.0,
         blind_frequency=1.0,
+        blind_every_n_trees=50,
         blind_seed=None,
     ):
         # Validate arguments
@@ -53,6 +57,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             feature_blinder=feature_blinder,
             blind_ratio=blind_ratio,
             blind_frequency=blind_frequency,
+            blind_every_n_trees=blind_every_n_trees,
             blind_seed=blind_seed,
         )
 
@@ -90,7 +95,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.feature_blinder = feature_blinder
         self.blind_ratio = blind_ratio
         self.blind_frequency = blind_frequency
+        self.blind_every_n_trees = blind_every_n_trees
         self.blind_seed = blind_seed
+        self.bin_indices_clean = None
+        self.blind_redraws_ = 0
+        self._bins_are_blinded = False
         self.label_encoder = None
         self.feature_importance_ = None
         self.per_era_feature_importance_ = None
@@ -165,6 +174,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             "min_child_weight",
             "threads_per_block",
             "rows_per_thread",
+            "blind_every_n_trees",
         ]
         float_params = [
             "learning_rate",
@@ -192,6 +202,11 @@ class WarpGBM(BaseEstimator, RegressorMixin):
                 raise TypeError(f"{param} must be a float, got {type(kwargs[param])}.")
             if not np.isfinite(kwargs[param]):
                 raise ValueError(f"{param} must be finite, got {kwargs[param]}.")
+
+        if isinstance(kwargs["blind_every_n_trees"], bool):
+            raise TypeError(
+                f"blind_every_n_trees must be an integer, got {type(kwargs['blind_every_n_trees'])}."
+            )
 
         if not isinstance(kwargs["feature_blinder"], bool):
             raise TypeError(
@@ -238,6 +253,10 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         if kwargs["blind_frequency"] < 0.0 or kwargs["blind_frequency"] > 1.0:
             raise ValueError(
                 f"Invalid blind_frequency: {kwargs['blind_frequency']}. Must be >= 0.0 and <= 1.0."
+            )
+        if kwargs["blind_every_n_trees"] < 1:
+            raise ValueError(
+                f"Invalid blind_every_n_trees: {kwargs['blind_every_n_trees']}. Must be at least 1."
             )
 
     def _compute_tree_predictions(self, tree, bin_indices):
@@ -318,93 +337,181 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             and self.blind_frequency > 0.0
         )
 
-    def _seed_for_tree(self, seed, round_idx):
+    def _blind_seed_for_round(self, seed, round_idx):
         return (
-            int(seed) + int(round_idx) * FEATURE_SELECTION_SEED_STRIDE
+            int(seed) + int(round_idx) * BLIND_SEED_STRIDE
         ) % TORCH_SEED_MODULUS
 
-    def _feature_selection_generator(self, round_idx):
+    def _blind_generator(self, round_idx):
         seed = self.blind_seed if self.blind_seed is not None else self.random_state
-        if seed is None or not self._feature_blinder_active():
+        if seed is None:
             return None
 
         generator = torch.Generator(device=self.device)
-        generator.manual_seed(self._seed_for_tree(seed, round_idx))
+        generator.manual_seed(self._blind_seed_for_round(seed, round_idx))
         return generator
 
-    def _select_colsample_features(self):
+    def _select_tree_features(self):
+        """Per-tree candidate features. Blinding happens on cells, not here."""
         if self.colsample_bytree < 1.0:
             k = max(1, int(self.colsample_bytree * self.num_features))
-            return torch.randperm(
+            self.feat_indices_tree = torch.randperm(
                 self.num_features,
                 device=self.device,
                 dtype=torch.int32,
             )[:k]
+        else:
+            self.feat_indices_tree = self.feature_indices
 
-        return self.feature_indices
-
-    def _select_tree_features_from_candidates(self, candidate_features, round_idx):
-        blinder_generator = self._feature_selection_generator(round_idx)
-        self.feat_indices_tree = self._blind_feature_candidates(
-            candidate_features, generator=blinder_generator
-        )
         self._feat_indices_are_identity = self.feat_indices_tree is self.feature_indices
         return self.feat_indices_tree
-
-    def _select_tree_features(self, round_idx):
-        return self._select_tree_features_from_candidates(
-            self._select_colsample_features(), round_idx
-        )
 
     def _global_feature_for_local(self, local_feature):
         if getattr(self, "_feat_indices_are_identity", False):
             return int(local_feature)
         return int(self.feat_indices_tree[local_feature].item())
 
-    def _blind_feature_candidates(self, candidate_features, generator=None):
+    # ─── Feature blinder: per-cell perturbation of the binned matrix ───
+
+    def _setup_blinder_buffers(self):
+        """Keep a pristine copy of the binned matrix to redraw perturbations from."""
+        self.blind_redraws_ = 0
+        self._bins_are_blinded = False
         if not self._feature_blinder_active():
-            return candidate_features
+            self.bin_indices_clean = None
+            return
 
+        self.bin_indices_clean = self.bin_indices
+        self.bin_indices = self.bin_indices_clean.clone()
+
+    def _release_blinder_buffers(self):
+        self.bin_indices_clean = None
+        self._bins_are_blinded = False
+
+    def _blind_bin(self):
+        """Bin index a blinded cell is set to: the middle (median) bin."""
+        return (self.num_bins - 1) // 2
+
+    def _blind_cell_probabilities(self):
+        """
+        Per-feature blinding probability, scaled by normalized feature importance.
+
+        Mirrors perturb_data_per_cell: importance is normalized by its max, then
+        multiplied by blind_ratio. Before any tree has recorded a split the
+        importance is all zeros, which falls back to a uniform blind_ratio.
+        """
+        importance = self.per_era_feature_importance_gpu.sum(dim=0).to(torch.float32)
+        importance = importance.clamp_min(0.0)
+        peak = importance.max()
+
+        if peak <= 0:
+            importance = torch.ones_like(importance)
+        else:
+            importance = importance / peak
+
+        return self.blind_ratio * importance
+
+    def _maybe_blind_cells(self, round_idx):
+        """
+        Redraw the per-cell blinding mask on the cadence set by blind_every_n_trees.
+
+        Round 0 is never blinded: like the reference trainer, the first
+        blind_every_n_trees trees fit clean data so that every perturbation is
+        weighted by importance the forest has actually accumulated.
+
+        Each redraw starts from the pristine matrix, so perturbations never
+        compound across events. Returns True when the matrix changed.
+        """
+        if not self._feature_blinder_active():
+            return False
+        if round_idx <= 0 or round_idx % self.blind_every_n_trees != 0:
+            return False
+
+        generator = self._blind_generator(round_idx)
         generator_kwargs = {"generator": generator} if generator is not None else {}
-
-        candidate_count = int(candidate_features.numel())
-        if candidate_count <= 1:
-            return candidate_features
 
         if self.blind_frequency < 1.0:
             event = torch.rand((), device=self.device, **generator_kwargs).item()
             if event >= self.blind_frequency:
-                return candidate_features
+                # No blinding this stretch: train on clean data until the next event.
+                if not self._bins_are_blinded:
+                    return False
+                self.bin_indices.copy_(self.bin_indices_clean)
+                self._bins_are_blinded = False
+                self._resync_train_scores()
+                return True
 
-        blind_count = min(
-            int(np.floor(self.blind_ratio * candidate_count)),
-            candidate_count - 1,
-        )
-        if blind_count <= 0:
-            return candidate_features
+        feature_probs = self._blind_cell_probabilities()
+        blind_bin = self._blind_bin()
 
-        weights = None
-        if hasattr(self, "per_era_feature_importance_gpu"):
-            weights = self.per_era_feature_importance_gpu.sum(dim=0).to(torch.float32)
-            weights = weights[candidate_features.to(torch.long)].clamp_min(0.0)
+        self.bin_indices.copy_(self.bin_indices_clean)
 
-        if weights is None or weights.sum().item() <= 0:
-            remove_local = torch.randperm(
-                candidate_count,
+        chunk_rows = max(1, BLIND_RANDOM_CHUNK_ELEMENTS // max(1, self.num_features))
+        for start in range(0, self.num_samples, chunk_rows):
+            stop = min(start + chunk_rows, self.num_samples)
+            draws = torch.rand(
+                (stop - start, self.num_features),
                 device=self.device,
-                **generator_kwargs,
-            )[:blind_count]
-        else:
-            remove_local = torch.multinomial(
-                weights + 1e-12,
-                num_samples=blind_count,
-                replacement=False,
+                dtype=torch.float32,
                 **generator_kwargs,
             )
+            self.bin_indices[start:stop].masked_fill_(draws < feature_probs, blind_bin)
+            del draws
 
-        keep_mask = torch.ones(candidate_count, dtype=torch.bool, device=self.device)
-        keep_mask[remove_local] = False
-        return candidate_features[keep_mask].contiguous()
+        self.blind_redraws_ += 1
+        self._bins_are_blinded = True
+        self._resync_train_scores()
+        return True
+
+    def _resync_train_scores(self):
+        """
+        Rebuild the accumulated training predictions against the current matrix.
+
+        Blinded cells reroute rows through the already-grown trees, so the running
+        prediction state is stale after a redraw. This is the equivalent of
+        LightGBM warm-starting a booster on a freshly perturbed Dataset.
+        """
+        if self._trees_trained == 0:
+            return
+
+        if self.objective in ("multiclass", "binary"):
+            self.gradients = self._multiclass_train_scores(self.bin_indices)
+        else:
+            self.gradients = self.predict_binned(self.bin_indices)
+
+    def _multiclass_train_scores(self, bin_indices):
+        """Class scores (logits) for the stored forest, initialized with training priors."""
+        num_samples = bin_indices.size(0)
+        scores = torch.zeros(
+            (num_samples, self.num_classes), dtype=torch.float32, device=self.device
+        )
+
+        for k in range(self.num_classes):
+            prior_k = (self.Y_gpu == k).float().mean()
+            if prior_k > 0:
+                scores[:, k] = torch.log(prior_k + 1e-10)
+
+        max_nodes = 2 ** (self.max_depth + 1)
+        bin_indices = bin_indices.contiguous()
+        for round_trees in self.forest[: self._trees_trained]:
+            if not round_trees:
+                continue
+            for k, tree in enumerate(round_trees):
+                if not tree:
+                    continue
+                tree_tensor = (
+                    self.flatten_tree(tree, max_nodes)
+                    .to(self.device)
+                    .unsqueeze(0)
+                    .contiguous()
+                )
+                tree_preds = torch.zeros(num_samples, device=self.device)
+                node_kernel.predict_forest(
+                    bin_indices, tree_tensor, self.learning_rate, tree_preds
+                )
+                scores[:, k] += tree_preds
+
+        return scores
 
     def _prepare_split_buffers(self, candidate_count):
         split_bins = self.num_bins - 1
@@ -649,7 +756,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
         self._setup_sorted_era_histogram_boundaries(era_id)
-        
+        self._setup_blinder_buffers()
+
         # Initialize gradients (predictions)
         if self.warm_start and self._is_fitted and self._trees_trained > 0:
             # Warm start: restore predictions from existing forest
@@ -685,6 +793,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         with torch.no_grad():
             self.grow_forest()
 
+        self._release_blinder_buffers()
         del self.bin_indices
         if hasattr(self, "bin_indices_hist"):
             del self.bin_indices_hist
@@ -704,38 +813,15 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.num_eras = len(self.unique_eras)
         self.era_indices = self.era_indices.to(dtype=torch.int32)
         self._setup_sorted_era_histogram_boundaries(era_id)
-        
+        self._setup_blinder_buffers()
+
         # Store labels as integers
         self.Y_gpu = torch.from_numpy(y_encoded).to(torch.int32).to(self.device)
-        
-        # Initialize scores F[i,k] - shape (N, K)
-        if self.warm_start and self._is_fitted and self._trees_trained > 0:
-            # Warm start: restore predictions from existing forest
-            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
-                                         dtype=torch.float32, device=self.device)
-            # Initialize with class priors
-            for k in range(self.num_classes):
-                prior_k = (self.Y_gpu == k).float().mean()
-                if prior_k > 0:
-                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
-            
-            # Add predictions from existing trees
-            for round_trees in self.forest[:self._trees_trained]:
-                for class_k, tree in enumerate(round_trees):
-                    if tree:
-                        leaf_updates = self._compute_tree_predictions(tree, self.bin_indices)
-                        self.gradients[:, class_k] += leaf_updates
-        else:
-            # Fresh start
-            self.gradients = torch.zeros((self.num_samples, self.num_classes), 
-                                         dtype=torch.float32, device=self.device)
-            
-            # Initialize with class priors (optional but helps convergence)
-            for k in range(self.num_classes):
-                prior_k = (self.Y_gpu == k).float().mean()
-                if prior_k > 0:
-                    self.gradients[:, k] = torch.log(prior_k + 1e-10)
-        
+
+        # Initialize scores F[i,k] - shape (N, K): class priors plus, on a warm
+        # start, the predictions of the forest trained so far.
+        self.gradients = self._multiclass_train_scores(self.bin_indices)
+
         self.root_node_indices = torch.arange(self.num_samples, device=self.device, dtype=torch.int32)
         self.feature_indices = torch.arange(self.num_features, device=self.device, dtype=torch.int32)
 
@@ -758,6 +844,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         with torch.no_grad():
             self.grow_forest_multiclass()
 
+        self._release_blinder_buffers()
         del self.bin_indices
         if hasattr(self, "bin_indices_hist"):
             del self.bin_indices_hist
@@ -1134,9 +1221,13 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             self.forest.extend([{} for _ in range(self.n_estimators - len(self.forest))])
 
         for i in range(start_iter, self.n_estimators):
+            if self._maybe_blind_cells(i):
+                # Rows moved between bins, so the cached root hessian is stale.
+                root_hessian_histogram_cache = None
+
             self.residual = self.Y_gpu - self.gradients
 
-            self.feat_indices_tree = self._select_tree_features(round_idx=i)
+            self.feat_indices_tree = self._select_tree_features()
             self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
             can_reuse_tree_root_hessian = (
                 can_reuse_root_hessian and self._feat_indices_are_identity
@@ -1198,20 +1289,17 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         start_iter = self._trees_trained if self.warm_start and self._is_fitted else 0
 
         for i in range(start_iter, self.n_estimators):
+            self._maybe_blind_cells(i)
+
             # Compute softmax probabilities and gradients/hessians for all classes
             grads, hess = self._compute_softmax_gradients_hessians(self.Y_gpu)
-            
-            # Train K trees (one per class)
-            trees_k = []
-            round_candidate_features = self._select_colsample_features()
-            
-            for class_k in range(self.num_classes):
-                tree_idx = i * self.num_classes + class_k
-                self.feat_indices_tree = self._select_tree_features_from_candidates(
-                    round_candidate_features, round_idx=tree_idx
-                )
-                self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
 
+            # Train K trees (one per class), all sharing this round's candidate columns
+            trees_k = []
+            self.feat_indices_tree = self._select_tree_features()
+            self._prepare_split_buffers(int(self.feat_indices_tree.numel()))
+
+            for class_k in range(self.num_classes):
                 # Set residual for this class (negative gradient)
                 self.residual = -grads[:, class_k]
                 
@@ -1572,6 +1660,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
             'feature_blinder': self.feature_blinder,
             'blind_ratio': self.blind_ratio,
             'blind_frequency': self.blind_frequency,
+            'blind_every_n_trees': self.blind_every_n_trees,
             'blind_seed': self.blind_seed,
             
             # Trained state
@@ -1636,6 +1725,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         self.feature_blinder = state.get('feature_blinder', False)
         self.blind_ratio = state.get('blind_ratio', 0.0)
         self.blind_frequency = state.get('blind_frequency', 1.0)
+        self.blind_every_n_trees = state.get('blind_every_n_trees', 50)
         self.blind_seed = state.get('blind_seed', None)
         
         # Restore trained state
