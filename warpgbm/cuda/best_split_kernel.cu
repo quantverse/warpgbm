@@ -2,6 +2,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <algorithm>
 
 constexpr int64_t DEFAULT_DYNAMIC_SHARED_LIMIT = 49152;
 
@@ -111,16 +112,19 @@ __global__ void directional_split_fused_kernel(
     float inv_E = 1.0f / (float)E;
 
     extern __shared__ float shmem[];
-    float *sh_gain = shmem;                    // [B - 1]
-    float *sh_agreement = &sh_gain[split_bins]; // [B - 1]
+    float *sh_gain = shmem;                                      // [split_bins * blockDim.x]
+    float *sh_agreement = &sh_gain[split_bins * blockDim.x];     // [split_bins * blockDim.x]
 
-    for (int b = threadIdx.x; b < split_bins; b += blockDim.x) {
-        sh_gain[b] = 0.0f;
-        sh_agreement[b] = 0.0f;
+    for (int b = 0; b < split_bins; ++b) {
+        int idx = b * blockDim.x + threadIdx.x;
+        sh_gain[idx] = 0.0f;
+        sh_agreement[idx] = 0.0f;
     }
     __syncthreads();
 
-    // Parallelize across eras within each feature block, reducing into shared memory.
+    // Parallelize across eras within each feature block. Each thread owns one
+    // slot per split bin, so accumulation needs no atomics and stays in a fixed
+    // increasing-era order per thread — the reduction is bitwise reproducible.
     for (int e = threadIdx.x; e < E; e += blockDim.x) {
         int base = e * F * B + f * B;
 
@@ -151,18 +155,33 @@ __global__ void directional_split_fused_kernel(
             }
 
             // Accumulate unscaled: direction sums stay exact integers, so cells with
-            // the same net direction count get bit-identical agreement regardless of
-            // atomic ordering. Scaling per-add would let the exact-equality
-            // agreement mask in select_split_fused drop true tie members.
-            atomicAdd(&sh_gain[b], gain);
-            atomicAdd(&sh_agreement[b], dir);
+            // the same net direction count get bit-identical agreement. Scaling
+            // per-add would let the exact-equality agreement mask in
+            // select_split_fused drop true tie members.
+            int idx = b * blockDim.x + threadIdx.x;
+            sh_gain[idx] += gain;
+            sh_agreement[idx] += dir;
         }
     }
     __syncthreads();
 
+    // Fixed pairwise tree reduction across thread slots: the combine order is a
+    // function of the launch configuration only, so results are reproducible.
+    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
+        int stride = (active + 1) / 2;
+        if (threadIdx.x < stride && threadIdx.x + stride < active) {
+            for (int b = 0; b < split_bins; ++b) {
+                int idx = b * blockDim.x + threadIdx.x;
+                sh_gain[idx] += sh_gain[idx + stride];
+                sh_agreement[idx] += sh_agreement[idx + stride];
+            }
+        }
+        __syncthreads();
+    }
+
     for (int b = threadIdx.x; b < split_bins; b += blockDim.x) {
-        fused_gain[out_base + b] = sh_gain[b] * inv_E;
-        fused_agreement[out_base + b] = fabsf(sh_agreement[b] * inv_E);
+        fused_gain[out_base + b] = sh_gain[b * blockDim.x] * inv_E;
+        fused_agreement[out_base + b] = fabsf(sh_agreement[b * blockDim.x] * inv_E);
     }
 }
 
@@ -179,10 +198,24 @@ void launch_directional_split_fused_kernel(
     int E = G.size(0);
     int F = G.size(1);
     int B = G.size(2);
+    TORCH_CHECK(B >= 2, "Fused split kernel requires at least 2 bins");
 
     dim3 blocks(F);
-    dim3 thread_dims(threads);
-    int shared_mem_bytes = 2 * (B - 1) * (int)sizeof(float);
+    int split_bins = B - 1;
+
+    // The deterministic reduction keeps 2 * split_bins per-thread floats in
+    // shared memory; shrink the block (whole warps) when the caller's thread
+    // count would exceed the dynamic shared-memory limit.
+    int64_t shared_per_thread = 2LL * split_bins * (int64_t)sizeof(float);
+    int threads_used = std::min(threads, 1024);
+    threads_used = std::min(threads_used, (int)(DEFAULT_DYNAMIC_SHARED_LIMIT / shared_per_thread));
+    threads_used = std::max(32, (threads_used / 32) * 32);
+    TORCH_CHECK(2LL * split_bins * threads_used * (int64_t)sizeof(float) <= DEFAULT_DYNAMIC_SHARED_LIMIT,
+                "Fused split kernel: num_bins too large for the deterministic reduction (",
+                split_bins, " split bins)");
+
+    dim3 thread_dims(threads_used);
+    int shared_mem_bytes = (int)(2LL * split_bins * threads_used * (int64_t)sizeof(float));
 
     directional_split_fused_kernel<<<blocks, thread_dims, shared_mem_bytes>>>(
         G.data_ptr<float>(),
@@ -197,140 +230,6 @@ void launch_directional_split_fused_kernel(
     cudaError_t err = cudaGetLastError();
     TORCH_CHECK(err == cudaSuccess,
                 "Fused directional split kernel launch failed: ",
-                cudaGetErrorString(err));
-}
-
-__global__ void directional_split_fused_no_atomic_kernel(
-    const float *__restrict__ G,                // [E * F * B]
-    const float *__restrict__ H,                // [E * F * B]
-    int E, int F, int B,
-    float min_split_gain,
-    float min_child_samples,
-    float eps,
-    float *__restrict__ fused_gain,             // [F * (B-1)]
-    float *__restrict__ fused_agreement         // [F * (B-1)]
-)
-{
-    constexpr int MAX_SPLIT_BINS = 8;
-    int f = blockIdx.x;
-    if (f >= F) return;
-
-    int split_bins = B - 1;
-    int out_base = f * split_bins;
-    float inv_E = 1.0f / (float)E;
-
-    float local_gain[MAX_SPLIT_BINS];
-    float local_direction[MAX_SPLIT_BINS];
-    for (int b = 0; b < MAX_SPLIT_BINS; ++b) {
-        local_gain[b] = 0.0f;
-        local_direction[b] = 0.0f;
-    }
-
-    for (int e = threadIdx.x; e < E; e += blockDim.x) {
-        int base = e * F * B + f * B;
-
-        float G_total = 0.0f, H_total = 0.0f;
-        for (int bb = 0; bb < B; ++bb) {
-            G_total += G[base + bb];
-            H_total += H[base + bb];
-        }
-
-        float G_L = 0.0f, H_L = 0.0f;
-        for (int b = 0; b < split_bins; ++b) {
-            G_L += G[base + b];
-            H_L += H[base + b];
-
-            float G_R = G_total - G_L;
-            float H_R = H_total - H_L;
-
-            if (H_L >= min_child_samples && H_R >= min_child_samples) {
-                float gain = (G_L * G_L) / (H_L + eps)
-                           + (G_R * G_R) / (H_R + eps)
-                           - (G_total * G_total) / (H_total + eps);
-                float left_val = G_L / (H_L + eps);
-                float right_val = G_R / (H_R + eps);
-                local_gain[b] += gain;
-                local_direction[b] += (left_val > right_val) ? 1.0f : -1.0f;
-            }
-        }
-    }
-
-    extern __shared__ float shmem[];
-    float *sh_gain = shmem;                                      // [split_bins * blockDim.x]
-    float *sh_direction = &sh_gain[split_bins * blockDim.x];     // [split_bins * blockDim.x]
-    for (int b = 0; b < split_bins; ++b) {
-        int idx = b * blockDim.x + threadIdx.x;
-        sh_gain[idx] = local_gain[b];
-        sh_direction[idx] = local_direction[b];
-    }
-    __syncthreads();
-
-    for (int active = blockDim.x; active > 1; active = (active + 1) / 2) {
-        int stride = (active + 1) / 2;
-        if (threadIdx.x < stride && threadIdx.x + stride < active) {
-            for (int b = 0; b < split_bins; ++b) {
-                int idx = b * blockDim.x + threadIdx.x;
-                sh_gain[idx] += sh_gain[idx + stride];
-                sh_direction[idx] += sh_direction[idx + stride];
-            }
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x < split_bins) {
-        float agreement = sh_direction[threadIdx.x * blockDim.x] * inv_E;
-        fused_gain[out_base + threadIdx.x] = sh_gain[threadIdx.x * blockDim.x] * inv_E;
-        fused_agreement[out_base + threadIdx.x] = fabsf(agreement);
-    }
-}
-
-void launch_directional_split_fused_no_atomic_kernel(
-    const at::Tensor &G,
-    const at::Tensor &H,
-    float min_split_gain,
-    float min_child_samples,
-    float eps,
-    at::Tensor &fused_gain,
-    at::Tensor &fused_agreement,
-    int threads = 128)
-{
-    int E = G.size(0);
-    int F = G.size(1);
-    int B = G.size(2);
-    TORCH_CHECK(B - 1 <= 8,
-                "No-atomic fused split kernel supports at most 8 split bins");
-
-    dim3 blocks(F);
-    dim3 thread_dims(threads);
-    int split_bins = B - 1;
-    int shared_mem_bytes = 2 * split_bins * threads * (int)sizeof(float);
-
-    if (shared_mem_bytes > DEFAULT_DYNAMIC_SHARED_LIMIT) {
-        launch_directional_split_fused_kernel(
-            G,
-            H,
-            min_split_gain,
-            min_child_samples,
-            eps,
-            fused_gain,
-            fused_agreement,
-            threads);
-        return;
-    }
-
-    directional_split_fused_no_atomic_kernel<<<blocks, thread_dims, shared_mem_bytes>>>(
-        G.data_ptr<float>(),
-        H.data_ptr<float>(),
-        E, F, B,
-        min_split_gain,
-        min_child_samples,
-        eps,
-        fused_gain.data_ptr<float>(),
-        fused_agreement.data_ptr<float>());
-
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess,
-                "No-atomic fused directional split kernel launch failed: ",
                 cudaGetErrorString(err));
 }
 

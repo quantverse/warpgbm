@@ -358,10 +358,10 @@ WarpGBM(
     feature_blinder=False,         # If True, blind individual cells during training
     blind_ratio=0.0,               # Base per-cell blinding probability
     blind_frequency=1.0,           # Probability a redraw event actually blinds
-    blind_every_n_trees=50,        # Redraw the blinding mask every N trees
+    blind_every_n_trees=50,        # Redraw the blinding mask every N rounds
     blind_seed=None,               # Optional seed for deterministic blinder draws
     threads_per_block=64,          # CUDA block size (tune for your GPU)
-    rows_per_thread=4,             # Rows processed per thread
+    rows_per_thread=56,            # Rows processed per thread
     device='cuda'                  # 'cuda' or 'cpu' (GPU strongly recommended)
 )
 ```
@@ -405,7 +405,7 @@ per_era_imp = model.get_per_era_feature_importance(normalize=True)  # shape: (n_
 
 Feature blinding is a training-time regularizer that overwrites **individual cells** of the training matrix with an uninformative value, so the forest cannot lean on any single feature always being observable. Each cell of feature `f` is blinded with probability `blind_ratio × importance[f] / max(importance)`, which concentrates the damage on the features the forest already relies on most.
 
-Every `blind_every_n_trees` trees the mask is redrawn from the pristine matrix, so perturbations never compound, and the accumulated training predictions are recomputed against the new matrix. `blind_seed` controls only the blinder draws; `random_state` continues to control `colsample_bytree` feature subsampling.
+Every `blind_every_n_trees` boosting rounds the mask is redrawn from the pristine matrix, so perturbations never compound, and the accumulated training predictions are recomputed against the new matrix. For multiclass and binary objectives each round builds one tree per class, so the mask is redrawn every `K × blind_every_n_trees` class trees. `blind_seed` controls only the blinder draws; `random_state` continues to control `colsample_bytree` feature subsampling.
 
 ```python
 model = WarpGBM(

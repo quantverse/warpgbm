@@ -116,16 +116,6 @@ void launch_directional_split_fused_kernel(
     at::Tensor &fused_agreement,  // [F, B-1]
     int threads = 128);
 
-void launch_directional_split_fused_no_atomic_kernel(
-    const at::Tensor &G,
-    const at::Tensor &H,
-    float min_split_gain,
-    float min_child_samples,
-    float eps,
-    at::Tensor &fused_gain,
-    at::Tensor &fused_agreement,
-    int threads = 128);
-
 void launch_select_split_fused_kernel(
     const at::Tensor &fused_gain,
     const at::Tensor &fused_agreement,
@@ -168,8 +158,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("compute_histogram_feature_tile_root", &launch_histogram_feature_tile_root_kernel, "Root Histogram Row-Major Feature Tile");
     m.def("subtract_histograms_inplace", &launch_subtract_histograms_inplace_kernel, "Subtract Grad/Hess Histograms In-Place (CUDA)");
     m.def("compute_split", &launch_directional_split_kernel, "Best Split (CUDA)");
-    m.def("compute_split_fused", &launch_directional_split_fused_kernel, "Best Split Fused (CUDA)");
-    m.def("compute_split_fused_no_atomic", &launch_directional_split_fused_no_atomic_kernel, "Best Split Fused No-Atomic (CUDA)");
+    m.def("compute_split_fused", &launch_directional_split_fused_kernel, "Best Split Fused (CUDA, deterministic era reduction)");
     m.def("select_split_fused", &launch_select_split_fused_kernel, "Select Best Fused Split (CUDA)");
     m.def("accumulate_feature_importance", &launch_accumulate_feature_importance_kernel, "Accumulate Selected Split Feature Importance (CUDA)");
     m.def("custom_cuda_binner", &launch_bin_column_kernel, "Custom CUDA binning kernel");

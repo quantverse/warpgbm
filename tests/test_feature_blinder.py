@@ -674,6 +674,95 @@ def test_multiclass_fit_with_blinder():
     assert all(0 <= int(f) < X.shape[1] for f in features)
 
 
+def test_multiclass_resync_rebuilds_scores_against_the_blinded_matrix():
+    X, y = make_classification(
+        n_samples=2000,
+        n_features=10,
+        n_informative=6,
+        n_classes=3,
+        random_state=2,
+    )
+    X = X.astype(np.float32)
+
+    model = WarpGBM(
+        objective="multiclass",
+        max_depth=3,
+        n_estimators=9,
+        num_bins=10,
+        feature_blinder=True,
+        blind_ratio=0.4,
+        blind_every_n_trees=3,
+        blind_seed=11,
+        random_state=11,
+    )
+
+    seen = []
+    original_resync = model._resync_train_scores
+
+    def recording_resync():
+        original_resync()
+        if model._trees_trained > 0 and model._bins_are_blinded:
+            expected = model._multiclass_train_scores(model.bin_indices)
+            seen.append(
+                (model._trees_trained, torch.allclose(model.gradients, expected, atol=1e-5))
+            )
+
+    model._resync_train_scores = recording_resync
+    model.fit(X, y)
+
+    assert model.blind_redraws_ == 2  # rounds 3 and 6
+    assert [round_idx for round_idx, _ in seen] == [3, 6]
+    assert all(match for _, match in seen), (
+        "scores must be rebuilt against the blinded matrix after a redraw, "
+        "not the clean one and not left stale"
+    )
+
+
+def test_binary_fit_with_blinder_resyncs_and_predicts_well_formed_proba():
+    X, y = make_classification(
+        n_samples=3000,
+        n_features=10,
+        n_informative=6,
+        n_redundant=0,
+        n_classes=2,
+        class_sep=3.0,
+        random_state=3,
+    )
+    X = X.astype(np.float32)
+
+    model = WarpGBM(
+        objective="binary",
+        max_depth=3,
+        n_estimators=6,
+        num_bins=10,
+        feature_blinder=True,
+        blind_ratio=0.5,
+        blind_every_n_trees=2,
+        blind_seed=13,
+        random_state=13,
+    )
+
+    resyncs = []
+    original_resync = model._resync_train_scores
+
+    def recording_resync():
+        original_resync()
+        resyncs.append((model._trees_trained, tuple(model.gradients.shape)))
+
+    model._resync_train_scores = recording_resync
+    model.fit(X, y)
+
+    assert model.blind_redraws_ == 2  # rounds 2 and 4; round 0 is the warm-up
+    # binary routes through the multiclass score machinery: (N, K) score state,
+    # rebuilt at each redraw round.
+    assert resyncs == [(2, (X.shape[0], 2)), (4, (X.shape[0], 2))]
+
+    probs = model.predict_proba(X)
+    assert probs.shape == (X.shape[0], 2)
+    assert np.all(np.isfinite(probs))
+    np.testing.assert_allclose(probs.sum(axis=1), 1.0, atol=1e-5)
+
+
 def test_multiclass_round_shares_one_candidate_set():
     X, y = make_classification(
         n_samples=1500,
@@ -731,6 +820,71 @@ def test_warm_start_continues_training_with_blinder():
     assert model._trees_trained == 12
     preds = model.predict(X)
     assert np.all(np.isfinite(preds))
+
+
+def test_warm_start_resume_is_a_fresh_segment_on_the_global_blind_cadence():
+    """Perturbation state is per-fit, but the redraw schedule is global.
+
+    Fit 53 rounds with blind_every_n_trees=50, then warm-start to 103: the
+    resumed segment must train on the clean matrix until round 100 — the next
+    GLOBAL multiple of the cadence — and redraw there, exactly once.
+    """
+    X, y = _regression_data(n=2000, f=10)
+
+    model = WarpGBM(
+        n_estimators=53,
+        warm_start=True,
+        feature_blinder=True,
+        blind_ratio=0.3,
+        blind_every_n_trees=50,
+        blind_seed=4,
+        random_state=4,
+    )
+
+    redraw_rounds = []
+    matrix_at_round = {}
+    pristine = []
+
+    original_maybe_blind = model._maybe_blind_cells
+
+    def spy_maybe_blind(round_idx):
+        redrawn = original_maybe_blind(round_idx)
+        if redrawn:
+            redraw_rounds.append(round_idx)
+        if not pristine:
+            pristine.append(model.bin_indices_clean.clone())
+        matrix_at_round[round_idx] = model.bin_indices.clone()
+        return redrawn
+
+    model._maybe_blind_cells = spy_maybe_blind
+
+    model.fit(X, y)
+    pristine_bins = pristine[0]
+
+    assert model._trees_trained == 53
+    assert redraw_rounds == [50]  # round 0 is the warm-up; only round 50 redraws
+    assert model.blind_redraws_ == 1
+    for round_idx in range(0, 50):
+        assert torch.equal(matrix_at_round[round_idx], pristine_bins)
+    # From the round-50 redraw to the end of the first segment: blinded.
+    for round_idx in range(50, 53):
+        assert not torch.equal(matrix_at_round[round_idx], pristine_bins)
+
+    model.n_estimators = 103
+    model.fit(X, y)
+
+    assert model._trees_trained == 103
+    # The schedule uses the GLOBAL round index: the resumed segment redraws at
+    # round 100 — not at its own first round and not at its own round 50-equivalent.
+    assert redraw_rounds == [50, 100]
+    # Perturbation state is per-fit: blind_redraws_ restarts at 0 for the segment.
+    assert model.blind_redraws_ == 1
+
+    # Rounds 53..99 of the resumed segment train on the clean matrix: the
+    # segment starts from pristine bins, with no mask carried over from fit 1.
+    for round_idx in range(53, 100):
+        assert torch.equal(matrix_at_round[round_idx], pristine_bins)
+    assert not torch.equal(matrix_at_round[100], pristine_bins)
 
 
 def test_fit_is_reproducible_with_a_fixed_blind_seed():

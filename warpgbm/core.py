@@ -938,7 +938,24 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
         return grad_hist, hess_hist
 
+    def _require_sorted_samples(self, sample_indices):
+        """
+        By-era kernels segment sample_indices with era offsets from
+        torch.searchsorted, which is only valid when sample_indices is sorted
+        ascending. Node subsets derive from arange via boolean masks in
+        grow_tree, which preserves order; raise instead of silently
+        mis-binning rows if that ever changes.
+        """
+        if sample_indices.numel() > 1 and not bool(
+            (sample_indices[1:] >= sample_indices[:-1]).all()
+        ):
+            raise RuntimeError(
+                "By-era histograms require sorted sample_indices; "
+                "got an unsorted node subset."
+            )
+
     def compute_histograms_by_era(self, sample_indices, feature_indices):
+        self._require_sorted_samples(sample_indices)
         grad_hist = torch.zeros(
             (self.num_eras, len(feature_indices), self.num_bins),
             device=self.device,
@@ -973,6 +990,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         return grad_hist, hess_hist
 
     def compute_root_gradient_histogram_by_era(self):
+        self._require_sorted_samples(self.root_node_indices)
         grad_hist = torch.zeros(
             (self.num_eras, self.num_features, self.num_bins),
             device=self.device,
@@ -1029,12 +1047,7 @@ class WarpGBM(BaseEstimator, RegressorMixin):
 
     def _find_best_split_fused(self, gradient_histogram, hessian_histogram):
         """Multi-era path: fused kernel reduces across eras on-GPU, outputs [F, B-1]."""
-        compute_split = (
-            node_kernel.compute_split_fused_no_atomic
-            if self.num_bins <= 9
-            else node_kernel.compute_split_fused
-        )
-        compute_split(
+        node_kernel.compute_split_fused(
             gradient_histogram,
             hessian_histogram,
             self.min_split_gain,
@@ -1104,6 +1117,8 @@ class WarpGBM(BaseEstimator, RegressorMixin):
         )
         
         split_mask = self.bin_indices[node_indices, split_feature] <= best_bin
+        # Boolean-mask indexing preserves ascending order: the by-era histogram
+        # kernels require sorted node subsets (see _require_sorted_samples).
         left_indices = node_indices[split_mask]
         right_indices = node_indices[~split_mask]
 

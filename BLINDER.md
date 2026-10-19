@@ -21,7 +21,7 @@ WarpGBM(
 - `feature_blinder`: enables per-cell blinding when `True`.
 - `blind_ratio`: base per-cell blinding probability — the `cell_prob` of the reference. Must be `>= 0.0` and `< 1.0`.
 - `blind_frequency`: probability that a redraw event actually blinds. On a miss, training runs on clean data until the next event. Must be `>= 0.0` and `<= 1.0`.
-- `blind_every_n_trees`: how often the mask is redrawn, in trees. The analogue of the reference's `BLIND_STEPS = 1000`. Must be `>= 1`.
+- `blind_every_n_trees`: how often the mask is redrawn, in boosting **rounds**. The analogue of the reference's `BLIND_STEPS = 1000`. Must be `>= 1`. This counts rounds, not individual trees: for multiclass and binary each round builds one tree per class, so a redraw happens every `K · blind_every_n_trees` class trees.
 - `blind_seed`: optional independent seed for blinder draws. If omitted, `random_state` is used when available. `colsample_bytree` subsampling remains controlled by `random_state` and PyTorch's active RNG state, and is entirely independent of the blinder.
 
 The blinder is active only when all of these hold:
@@ -57,7 +57,7 @@ When the blinder is active, `fit` keeps the pristine binned matrix as `bin_indic
 round_idx > 0 and round_idx % blind_every_n_trees == 0
 ```
 
-Round 0 is deliberately never blinded. The reference trains a first block of `BLIND_STEPS` rounds on clean data before its first call to `perturb_data_per_cell`, so that every perturbation is weighted by importance the model has actually accumulated. Skipping round 0 reproduces that: the first `blind_every_n_trees` trees fit clean data.
+Round 0 is deliberately never blinded. The reference trains a first block of `BLIND_STEPS` rounds on clean data before its first call to `perturb_data_per_cell`, so that every perturbation is weighted by importance the model has actually accumulated. Skipping round 0 reproduces that: the first `blind_every_n_trees` rounds fit clean data.
 
 When the round qualifies:
 
@@ -117,7 +117,7 @@ Per-tree feature selection is now `colsample_bytree` only, in `_select_tree_feat
 
 Only the training matrix is perturbed. `bin_indices_eval` is built once from `X_eval` and never touched, matching the reference's static validation set. Trained trees store global feature ids and ordinary bin thresholds, so prediction is unaffected by whether blinding was used.
 
-Warm-start resumption re-preprocesses `X` into a clean matrix and rebuilds scores from the stored forest, then re-enters the same global `round_idx % blind_every_n_trees` schedule.
+Warm-start resumption is a fresh blinding segment. Perturbation state is per-fit: `fit` re-preprocesses `X` into a clean matrix, rebuilds scores from the stored forest, and resets the `blind_redraws_` counter to 0 — no mask survives across fits. The redraw schedule, however, keeps the global round index (`_maybe_blind_cells` fires on `round_idx % blind_every_n_trees == 0`, with `round_idx` continuing from `_trees_trained`), so a resumed segment starting mid-stretch trains on the clean matrix until the next global-cadence redraw. Training 53 rounds with `blind_every_n_trees=50` and then resuming to 103 redraws at round 100 and not before — rounds 53–99 of the resumed segment fit clean data. That differs from a single continuous 103-round fit over the same total tree count, which redraws at rounds 50 and 100 and trains every round from 50 on perturbed data; the masks differ because importance differs at redraw time.
 
 ## Cost
 
@@ -131,7 +131,7 @@ With `blind_seed` set, the mask for a given round is deterministic. The per-roun
 (seed + round_idx * BLIND_SEED_STRIDE) % 2**64
 ```
 
-Seeded blinder draws do not make the whole CUDA training run bitwise deterministic; the histogram and split kernels retain the nondeterminism documented elsewhere for WarpGBM.
+Seeded blinder draws do not make the whole CUDA training run bitwise deterministic. Float gradient-histogram accumulation still happens in a run-dependent order, so histograms — and therefore full training runs — are not bitwise reproducible. Split *selection* given identical histograms is deterministic: the fused split kernel reduces candidates in a fixed order, so the same histograms always produce the same winning split. The nondeterminism enters through histogram accumulation, not split choice.
 
 ## Relationship to the Reference
 

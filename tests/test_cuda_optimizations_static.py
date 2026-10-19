@@ -42,7 +42,8 @@ class CudaOptimizationStaticTests(unittest.TestCase):
             r"\s*e\s*\+=\s*blockDim\.x\s*\)",
         )
         self.assertIn("extern __shared__ float shmem[]", fused_kernel)
-        self.assertIn("atomicAdd(&sh_gain", fused_kernel)
+        self.assertNotIn("atomicAdd", fused_kernel)
+        self.assertIn("sh_gain[idx] += sh_gain[idx + stride]", fused_kernel)
         self.assertNotRegex(
             fused_kernel,
             r"int\s+f\s*=\s*blockIdx\.x\s*\*\s*blockDim\.x\s*\+\s*threadIdx\.x",

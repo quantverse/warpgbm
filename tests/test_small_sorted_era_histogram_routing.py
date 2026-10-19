@@ -55,6 +55,32 @@ class SmallSortedEraHistogramRoutingTests(unittest.TestCase):
 
         self.assertEqual(model.by_era_calls, 0)
 
+    def test_by_era_histograms_reject_unsorted_node_subsets(self):
+        import torch
+        from warpgbm import WarpGBM
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for WarpGBM training")
+
+        model = WarpGBM(
+            objective="regression",
+            num_bins=4,
+            max_depth=1,
+            n_estimators=1,
+            device="cuda",
+        )
+
+        sorted_indices = torch.arange(8, dtype=torch.int32, device="cuda")
+        model._require_sorted_samples(sorted_indices)  # must not raise
+
+        # The by-era kernels segment rows with searchsorted offsets; an unsorted
+        # node subset would silently mis-bin rows without this guard.
+        unsorted_indices = torch.tensor([0, 5, 2, 7], dtype=torch.int32, device="cuda")
+        with self.assertRaises(RuntimeError):
+            model.compute_histograms_by_era(
+                unsorted_indices, torch.arange(2, dtype=torch.int32, device="cuda")
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

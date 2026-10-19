@@ -9,7 +9,7 @@ The pre-optimization (main) multi-era split path was:
     best = argmax(criterion masked)                             # torch
 
 The optimized path fuses the era reduction and the selection into CUDA kernels
-(compute_split_fused / compute_split_fused_no_atomic + select_split_fused).
+(compute_split_fused + select_split_fused, deterministic for any num_bins).
 The old `compute_split` kernel is still compiled into the extension and is
 byte-identical to main, so the legacy pipeline can be reconstructed exactly
 and compared in-process.
@@ -77,7 +77,7 @@ def legacy_find_best_split(grad_hist, hess_hist, min_split_gain, min_child_weigh
 
 
 def fused_find_best_split(grad_hist, hess_hist, min_split_gain, min_child_weight, L2_reg, threads=64):
-    """Mirror of WarpGBM._find_best_split_fused, including the num_bins<=9 routing rule."""
+    """Mirror of WarpGBM._find_best_split_fused."""
     import torch
     from warpgbm.cuda import node_kernel
 
@@ -86,9 +86,7 @@ def fused_find_best_split(grad_hist, hess_hist, min_split_gain, min_child_weight
     fused_agreement = torch.zeros_like(fused_gain)
     best_split_idx = torch.empty(1, device=grad_hist.device, dtype=torch.int32)
 
-    compute_split = (
-        node_kernel.compute_split_fused_no_atomic if B <= 9 else node_kernel.compute_split_fused
-    )
+    compute_split = node_kernel.compute_split_fused
     compute_split(
         grad_hist,
         hess_hist,
@@ -171,9 +169,9 @@ class FusedSplitDecisionEquivalence(unittest.TestCase):
             ),
         )
 
-    def test_no_atomic_path_matches_legacy_randomized(self):
+    def test_small_bin_configs_match_legacy_randomized(self):
         _cuda_or_skip(self)
-        # num_bins <= 9 routes to the no-atomic kernel: the production (Numerai) regime.
+        # Small-bin configs: the production (Numerai) regime.
         configs = []
         seed = 0
         for E in (2, 3, 5, 8, 31, 96, 324):
@@ -186,9 +184,9 @@ class FusedSplitDecisionEquivalence(unittest.TestCase):
         for cfg in configs:
             self._run_config(*cfg)
 
-    def test_atomic_path_matches_legacy_randomized(self):
+    def test_large_bin_configs_match_legacy_randomized(self):
         _cuda_or_skip(self)
-        # num_bins > 9 routes to the atomic fused kernel.
+        # Large-bin configs.
         configs = []
         seed = 1000
         for E in (2, 7, 33, 96):
